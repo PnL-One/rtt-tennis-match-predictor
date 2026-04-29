@@ -1,0 +1,55 @@
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Parser raw outputs
+saved_rtt_pages/
+rtt_rankings_saved/
+matches_saved/
+screenshots/
+
+assembled_predictor/model_results/
+
+# Archives and logs
+*.zip
+*.log
+
+# Model binaries
+*.pkl
+*.joblib
+*.cbm
+
+# OS files
+.DS_Store
+Thumbs.db
+catboost_info/catboost_training.json
+catboost_info/learn_error.tsv
+catboost_info/test_error.tsv
+catboost_info/time_left.tsv
+catboost_info/learn/events.out.tfevents
+catboost_info/test/events.out.tfevents
+model_results/run_20260429_131736/01_metrics/model_metrics.csv
+model_results/run_20260429_131736/01_metrics/rating_only_scale_grid.csv
+model_results/run_20260429_131736/02_predictions/match_predictions.csv
+model_results/run_20260429_131736/03_features/baseline_rating_elo_features.csv
+model_results/run_20260429_131736/03_features/feature_catalog.csv
+model_results/run_20260429_131736/03_features/feature_importance.csv
+model_results/run_20260429_131736/03_features/final_model_features.csv
+model_results/run_20260429_131736/04_diagnostics/dataset_overview.csv
+model_results/run_20260429_131736/05_model_selection/catboost_training_mode_selection.csv
+model_results/run_20260429_135326/01_metrics/adjusted_rating_only_scale_grid.csv
+model_results/run_20260429_135326/01_metrics/model_metrics.csv
+model_results/run_20260429_135326/01_metrics/rating_only_scale_grid.csv
+model_results/run_20260429_135326/02_predictions/match_predictions.csv
+model_results/run_20260429_135326/03_features/baseline_rating_elo_features.csv
+model_results/run_20260429_135326/03_features/feature_catalog.csv
+model_results/run_20260429_135326/03_features/feature_importance.csv
+model_results/run_20260429_135326/03_features/final_model_features.csv
+model_results/run_20260429_135326/04_diagnostics/dataset_overview.csv
+model_results/run_20260429_135326/05_model_selection/catboost_training_mode_selection.csv
