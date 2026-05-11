@@ -1,0 +1,75 @@
+{
+  "generated_at": "2026-05-11T18:52:10.344040+00:00",
+  "tournaments": {
+    "file": {
+      "exists": true,
+      "path": "data\\tournaments_master.xlsx",
+      "size_bytes": 51270,
+      "modified_at": "2026-05-11T18:50:52.682368+00:00"
+    },
+    "rows": 430,
+    "unique_tour_ids": 430,
+    "min_start_date": "2025-03-01",
+    "max_start_date": "2026-04-13",
+    "matches_page_saved_count": 0
+  },
+  "saved_pages": {
+    "html_dir": "saved_rtt_pages\\html",
+    "html_pages": 429,
+    "latest_html_modified_at": "2026-04-18T17:42:15.780762+00:00"
+  },
+  "rankings": {
+    "file": {
+      "exists": true,
+      "path": "rtt_rankings_saved\\rtt_rankings_all_dates.csv",
+      "size_bytes": 82701470,
+      "modified_at": "2026-04-28T10:36:00.729755+00:00"
+    },
+    "rows": 203504,
+    "unique_rni": 8534,
+    "min_ranking_date": "2025-02-01",
+    "max_ranking_date": "2026-04-01",
+    "ranking_date_age_group_pairs": 56
+  },
+  "dataset": {
+    "file": {
+      "exists": true,
+      "path": "assembled_predictor\\predictor_model_dataset_from_parsers.xlsx",
+      "size_bytes": 21134579,
+      "modified_at": "2026-04-29T13:11:08.146706+00:00"
+    },
+    "sheets": [
+      "ml_dataset",
+      "matches_enriched",
+      "player_matching",
+      "coverage",
+      "rating_history",
+      "matches_parsed_raw",
+      "players_without_rni",
+      "players_without_rating",
+      "dropped_invalid_matches",
+      "dropped_duplicate_matches",
+      "player_matching_audit",
+      "ambiguous_rni_candidates",
+      "rating_age_group_check",
+      "build_summary"
+    ],
+    "coverage": {
+      "completed_matches": 7533.0,
+      "double_entry_rows": 15066.0,
+      "unique_players_in_matches": 1307.0,
+      "matched_players": 1267.0,
+      "ambiguous_players": 23.0,
+      "unmatched_players": 17.0,
+      "rating_history_rows": 203504.0,
+      "rating_history_unique_rni": 8534.0,
+      "player1_rni_match_rate": 0.97610513739546,
+      "player2_rni_match_rate": 0.9757068896853843,
+      "player1_rating_coverage": 0.9742466480817735,
+      "player2_rating_coverage": 0.9747776450285411
+    },
+    "ml_rows": 15066,
+    "max_match_date": "2026-04-17",
+    "min_match_date": "2025-03-02"
+  }
+}

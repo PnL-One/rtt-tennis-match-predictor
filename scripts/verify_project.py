@@ -27,6 +27,11 @@ def main() -> None:
         root / "README.md",
         root / "requirements.txt",
         root / "docs" / "model_report.md",
+        root / "data" / "tournaments_master.xlsx",
+        root / "data" / "data_manifest.json",
+        root / "scripts" / "bootstrap_tournaments_master.py",
+        root / "scripts" / "data_status.py",
+        root / "notebooks" / "00_data_control_panel.ipynb",
         root / "notebooks" / "01_save_and_parse_matches.ipynb",
         root / "notebooks" / "02_parse_rankings.ipynb",
         root / "notebooks" / "03_build_final_dataset.ipynb",
@@ -52,6 +57,16 @@ def main() -> None:
     if coverage.empty:
         raise ValueError("Лист coverage пуст.")
 
+    tournaments_path = root / "data" / "tournaments_master.xlsx"
+    tournaments = pd.read_excel(tournaments_path)
+    required_tournament_columns = {"tour_id", "tournament_name", "age_category", "start_date", "matches_url"}
+    missing_tournament_columns = required_tournament_columns.difference(tournaments.columns)
+    if missing_tournament_columns:
+        raise ValueError(f"tournaments_master.xlsx is missing columns: {sorted(missing_tournament_columns)}")
+    if tournaments["tour_id"].duplicated().any():
+        raise ValueError("tournaments_master.xlsx contains duplicate tour_id values.")
+
+    print("tournaments ok: data/tournaments_master.xlsx")
     print("dataset ok: assembled_predictor/predictor_model_dataset_from_parsers.xlsx")
     print("project verification passed")
 

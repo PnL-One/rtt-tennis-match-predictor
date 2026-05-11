@@ -32,6 +32,9 @@
 
 ## Ноутбуки
 
+0. `notebooks/00_data_control_panel.ipynb`  
+   Показывает локальный статус данных, обновляет `data/tournaments_master.xlsx` из текущего Excel со ссылками и запускает быструю проверку проекта.
+
 1. `notebooks/01_save_and_parse_matches.ipynb`  
    Сохраняет страницы турниров РТТ и извлекает строки матчей из HTML.
 
@@ -49,6 +52,16 @@
 ## Данные и признаки
 
 Финальный датасет хранится в `assembled_predictor/predictor_model_dataset_from_parsers.xlsx`.
+
+Список турниров теперь хранится отдельно в `data/tournaments_master.xlsx`. Это мастер-файл для скачивания страниц матчей: новые турниры должны добавляться в него с дедупликацией по `tour_id`, а затем ноутбук `notebooks/01_save_and_parse_matches.ipynb` использует уже этот файл как источник ссылок.
+
+Для контроля свежести локальных данных можно запустить:
+
+```bash
+python scripts/data_status.py --write-manifest
+```
+
+Команда показывает количество турниров, сохраненных HTML-страниц, свежесть рейтингов и максимальную дату матчей в финальном датасете. Снимок статуса сохраняется в `data/data_manifest.json`.
 
 В модели используются группы признаков:
 
@@ -98,6 +111,7 @@ python scripts/verify_project.py
 
 Ожидаемый порядок запуска:
 
+0. Открыть `notebooks/00_data_control_panel.ipynb`, проверить свежесть данных и при необходимости обновить `data/tournaments_master.xlsx`.
 1. Запустить `notebooks/01_save_and_parse_matches.ipynb`.
 2. Запустить `notebooks/02_parse_rankings.ipynb`.
 3. Запустить `notebooks/03_build_final_dataset.ipynb`.
