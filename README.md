@@ -143,3 +143,16 @@ python scripts/verify_project.py
 - Проект не учитывает травмы, покрытие, усталость вне истории матчей и другие внешние факторы.
 - Метрики относятся к историческому test split и не гарантируют качество на будущих данных.
 - Репозиторий хранит только актуальную версию основного predictor-ноутбука; промежуточные версии удалены из текущей ветки.
+## Production scripts
+
+The reproducible update path is now script-first:
+
+```bash
+python scripts/parse_rtt_calendar.py
+python scripts/parse_rtt_matches.py
+python scripts/parse_rtt_rankings.py
+python scripts/build_final_dataset.py
+python scripts/train_model.py
+```
+
+`notebooks/01_save_and_parse_matches.ipynb` through `notebooks/04_train_final_model.ipynb` are kept for review, manual diagnostics, and the interactive prediction UI. `scripts/run_full_pipeline.py` runs the production scripts directly instead of executing notebooks through `nbconvert`.

@@ -9,7 +9,6 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-NOTEBOOKS = PROJECT_ROOT / "notebooks"
 
 
 def run_step(name: str, command: list[str]) -> None:
@@ -24,32 +23,13 @@ def run_step(name: str, command: list[str]) -> None:
         raise SystemExit(f"Step failed: {name} (exit code {completed.returncode})")
 
 
-def run_notebook(path: Path) -> None:
-    run_step(
-        f"Execute {path.relative_to(PROJECT_ROOT)}",
-        [
-            sys.executable,
-            "-u",
-            "-m",
-            "jupyter",
-            "nbconvert",
-            "--to",
-            "notebook",
-            "--execute",
-            "--inplace",
-            "--ExecutePreprocessor.timeout=-1",
-            str(path),
-        ],
-    )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the full RTT predictor update pipeline.")
     parser.add_argument("--skip-calendar", action="store_true", help="Skip RTT calendar/tournament master update.")
-    parser.add_argument("--skip-matches", action="store_true", help="Skip match page download and parsing notebook.")
-    parser.add_argument("--skip-rankings", action="store_true", help="Skip ranking parser notebook.")
-    parser.add_argument("--skip-dataset", action="store_true", help="Skip final dataset build notebook.")
-    parser.add_argument("--skip-training", action="store_true", help="Skip model training notebook.")
+    parser.add_argument("--skip-matches", action="store_true", help="Skip match page download and parsing.")
+    parser.add_argument("--skip-rankings", action="store_true", help="Skip ranking parser.")
+    parser.add_argument("--skip-dataset", action="store_true", help="Skip final dataset build.")
+    parser.add_argument("--skip-training", action="store_true", help="Skip model training.")
     args = parser.parse_args()
 
     print("Full RTT predictor pipeline")
@@ -60,16 +40,16 @@ def main() -> None:
         run_step("Update tournament ids and details from RTT calendar", [sys.executable, "-u", "scripts/parse_rtt_calendar.py"])
 
     if not args.skip_matches:
-        run_notebook(NOTEBOOKS / "01_save_and_parse_matches.ipynb")
+        run_step("Download and parse RTT match pages", [sys.executable, "-u", "scripts/parse_rtt_matches.py"])
 
     if not args.skip_rankings:
-        run_notebook(NOTEBOOKS / "02_parse_rankings.ipynb")
+        run_step("Download and parse RTT rankings", [sys.executable, "-u", "scripts/parse_rtt_rankings.py"])
 
     if not args.skip_dataset:
-        run_notebook(NOTEBOOKS / "03_build_final_dataset.ipynb")
+        run_step("Build final model dataset", [sys.executable, "-u", "scripts/build_final_dataset.py"])
 
     if not args.skip_training:
-        run_notebook(NOTEBOOKS / "04_train_final_model.ipynb")
+        run_step("Train model and save diagnostics", [sys.executable, "-u", "scripts/train_model.py"])
 
     run_step("Refresh data manifest", [sys.executable, "-u", "scripts/data_status.py", "--write-manifest"])
     run_step("Verify project", [sys.executable, "-u", "scripts/verify_project.py"])
