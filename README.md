@@ -156,3 +156,5 @@ python scripts/train_model.py
 ```
 
 `notebooks/01_save_and_parse_matches.ipynb` through `notebooks/04_train_final_model.ipynb` are kept for review, manual diagnostics, and the interactive prediction UI. `scripts/run_full_pipeline.py` runs the production scripts directly instead of executing notebooks through `nbconvert`.
+
+For the production scripts install `requirements.txt`. If you also need to run notebooks in a fresh Python environment, install `requirements-notebook.txt` in that notebook environment.
