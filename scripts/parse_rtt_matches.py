@@ -57,6 +57,7 @@ def Markdown(text):
 # In[2]:
 
 
+from datetime import date
 from pathlib import Path
 import os
 import re
@@ -169,6 +170,111 @@ def build_output_file_base(row_index: int, tournament_name: str, age_category: s
     age_category = sanitize_file_name(age_category)
     return f"{row_index + 1:04d}_{tour_id}_{tournament_name}_{age_category}"
 
+def normalize_status(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.lower().replace("ё", "е")
+
+def is_cancelled_status(value: Any) -> bool:
+    status = normalize_status(value)
+    return "отмен" in status or "аннулир" in status
+
+def is_completed_status(value: Any) -> bool:
+    status = normalize_status(value)
+    return "заверш" in status
+
+def bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if pd.isna(value):
+        return False
+    text = str(value).strip().lower()
+    return text in {"true", "1", "yes", "y", "да"}
+
+def parse_start_date(value: Any) -> pd.Timestamp:
+    return pd.to_datetime(value, errors="coerce", dayfirst=True)
+
+def resolve_existing_html_path(expected_path: Path, tour_id: str | None) -> Path | None:
+    if expected_path.exists():
+        return expected_path
+    if tour_id:
+        matches = sorted(HTML_DIR.glob(f"*_{tour_id}_*.html"))
+        if matches:
+            return matches[0]
+    return None
+
+def build_rows_to_process(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows = df[df[LINK_COLUMN_NAME].notna()].copy()
+    rows = rows[rows[LINK_COLUMN_NAME].astype(str).str.strip() != ""]
+    rows = rows.reset_index(drop=False)
+
+    today = pd.Timestamp(date.today())
+    rows["_start_date_dt"] = rows.get("start_date", pd.Series(pd.NaT, index=rows.index)).map(parse_start_date)
+    rows["_is_future"] = rows["_start_date_dt"].notna() & rows["_start_date_dt"].gt(today)
+    rows["_is_cancelled"] = rows.get("status", pd.Series("", index=rows.index)).map(is_cancelled_status)
+    rows["_is_completed"] = rows.get("status", pd.Series("", index=rows.index)).map(is_completed_status)
+    rows["_matches_page_saved_bool"] = rows.get("matches_page_saved", pd.Series(False, index=rows.index)).map(bool_value)
+
+    skipped_rows: List[Dict[str, Any]] = []
+    process_mask = []
+
+    for _, row in rows.iterrows():
+        source_index = int(row["index"])
+        tournament_name = str(row.get("tournament_name", row.get("Турнир", ""))).strip()
+        age_category = str(row.get("age_category", row.get("Возрастная категория", ""))).strip()
+        url = str(row[LINK_COLUMN_NAME]).strip()
+        tour_id = extract_tour_id(url)
+        file_base = build_output_file_base(source_index, tournament_name, age_category, url)
+        expected_html_path = HTML_DIR / f"{file_base}.html"
+        cached_html_path = resolve_existing_html_path(expected_html_path, tour_id)
+
+        skip_reason = ""
+        save_status = ""
+        use_cached = False
+
+        if row["_is_future"]:
+            skip_reason = "future_start_date"
+            save_status = "skipped_future"
+        elif row["_is_cancelled"]:
+            skip_reason = "cancelled"
+            save_status = "skipped_cancelled"
+        elif row["_is_completed"] and row["_matches_page_saved_bool"] and cached_html_path is not None:
+            skip_reason = "completed_cached"
+            save_status = "ok"
+            use_cached = True
+
+        if skip_reason:
+            skipped_rows.append({
+                "source_index": source_index,
+                "Турнир": tournament_name,
+                "Возрастная категория": age_category,
+                "Дата начала": str(row.get("start_date", "")).strip(),
+                "Город": str(row.get("city", row.get("Город", ""))).strip(),
+                "Ссылка на страницу с матчами": url,
+                "tour_id": tour_id,
+                "html_path": str(cached_html_path or expected_html_path),
+                "screenshot_path": str(SCREENSHOT_DIR / f"{file_base}.png"),
+                "save_status": save_status,
+                "save_error": "",
+                "skip_reason": skip_reason,
+                "used_cached_html": use_cached,
+            })
+            process_mask.append(False)
+        else:
+            process_mask.append(True)
+
+    rows_to_process = rows[process_mask].copy().reset_index(drop=True)
+    skipped_df = pd.DataFrame(skipped_rows)
+    print(
+        "Tournament download plan: "
+        f"{len(rows)} eligible links, {len(rows_to_process)} to download, {len(skipped_df)} skipped/cached"
+    )
+    if not skipped_df.empty:
+        print(skipped_df["skip_reason"].value_counts(dropna=False).to_string())
+    return rows_to_process, skipped_df
+
 async def auto_scroll_page(page) -> None:
     previous_height = 0
 
@@ -225,9 +331,7 @@ async def click_expand_buttons_if_any(page) -> None:
 async def save_rendered_pages_from_excel(input_excel_path: str) -> pd.DataFrame:
     df = pd.read_excel(input_excel_path)
 
-    rows_to_process = df[df[LINK_COLUMN_NAME].notna()].copy()
-    rows_to_process = rows_to_process[rows_to_process[LINK_COLUMN_NAME].astype(str).str.strip() != ""]
-    rows_to_process = rows_to_process.reset_index(drop=False)
+    rows_to_process, skipped_df = build_rows_to_process(df)
 
     save_log_rows: List[Dict[str, Any]] = []
 
@@ -300,6 +404,8 @@ async def save_rendered_pages_from_excel(input_excel_path: str) -> pd.DataFrame:
                     "screenshot_path": str(screenshot_path),
                     "save_status": status,
                     "save_error": error_text,
+                    "skip_reason": "",
+                    "used_cached_html": False,
                 })
 
         finally:
@@ -307,7 +413,19 @@ async def save_rendered_pages_from_excel(input_excel_path: str) -> pd.DataFrame:
             await browser.close()
 
     save_log_df = pd.DataFrame(save_log_rows)
+    if not skipped_df.empty:
+        save_log_df = pd.concat([save_log_df, skipped_df], ignore_index=True)
     save_log_df.to_excel(SAVE_LOG_PATH, index=False)
+
+    if TOURNAMENTS_MASTER_PATH.exists() and "tour_id" in df.columns and "matches_page_saved" in df.columns:
+        ok_tour_ids = set(save_log_df.loc[save_log_df["save_status"].eq("ok"), "tour_id"].dropna().astype(str))
+        if ok_tour_ids:
+            updated_master = df.copy()
+            updated_master["tour_id"] = updated_master["tour_id"].astype(str)
+            updated_master.loc[updated_master["tour_id"].isin(ok_tour_ids), "matches_page_saved"] = True
+            updated_master.to_excel(TOURNAMENTS_MASTER_PATH, index=False)
+            print(f"Updated matches_page_saved for {len(ok_tour_ids)} tournaments in {TOURNAMENTS_MASTER_PATH}")
+
     return save_log_df
 
 
