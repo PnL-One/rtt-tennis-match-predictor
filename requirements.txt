@@ -9,3 +9,4 @@ openpyxl
 tqdm
 ipython
 jupyter
+ipywidgets
