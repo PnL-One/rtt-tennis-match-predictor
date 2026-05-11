@@ -1,16 +1,16 @@
 {
-  "generated_at": "2026-05-11T20:28:17.246742+00:00",
+  "generated_at": "2026-05-11T20:35:47.208461+00:00",
   "tournaments": {
     "file": {
       "exists": true,
       "path": "data\\tournaments_master.xlsx",
-      "size_bytes": 50723,
-      "modified_at": "2026-05-11T20:28:11.126296+00:00"
+      "size_bytes": 56623,
+      "modified_at": "2026-05-11T20:34:20.313853+00:00"
     },
-    "rows": 430,
-    "unique_tour_ids": 430,
+    "rows": 473,
+    "unique_tour_ids": 473,
     "min_start_date": "2025-03-01",
-    "max_start_date": "2026-04-13",
+    "max_start_date": "2026-07-27",
     "matches_page_saved_count": 0
   },
   "saved_pages": {
