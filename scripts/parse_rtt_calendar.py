@@ -967,13 +967,34 @@ async def apply_filters(page, config: CalendarConfig, age_category: str) -> list
 
 
 async def wait_for_calendar(page) -> None:
-    await page.goto(CALENDAR_URL, wait_until="domcontentloaded", timeout=60_000)
-    await page.wait_for_timeout(4_000)
-    heading = page.get_by_role("heading", name="Календарь турниров", exact=True)
-    if await heading.count():
-        await heading.first.wait_for(timeout=60_000)
-        return
-    await page.get_by_text("Календарь турниров", exact=False).first.wait_for(timeout=60_000)
+    last_error: Exception | None = None
+
+    for attempt in range(1, 4):
+        try:
+            print(f"Opening RTT calendar, attempt {attempt}/3", flush=True)
+            await page.goto(CALENDAR_URL, wait_until="domcontentloaded", timeout=60_000)
+            await page.wait_for_timeout(5_000)
+
+            heading = page.get_by_role("heading", name="Календарь турниров", exact=True)
+            if await heading.count():
+                await heading.first.wait_for(timeout=20_000)
+                return
+
+            body_text = normalize_text(await page.locator("body").inner_text(timeout=20_000))
+            if (
+                "Календарь турниров" in body_text
+                or "Статус проведения" in body_text
+                or "Период проведения" in body_text
+            ):
+                return
+
+            raise RuntimeError("Calendar form text was not found after page load.")
+        except Exception as exc:
+            last_error = exc
+            await save_debug_artifacts(page, f"calendar_open_fail_attempt_{attempt}")
+            await page.wait_for_timeout(3_000 * attempt)
+
+    raise RuntimeError(f"Could not open RTT calendar after 3 attempts: {last_error}") from last_error
 
 
 async def fetch_calendar_age_group(page, config: CalendarConfig, age_category: str) -> pd.DataFrame:

@@ -69,6 +69,7 @@ def main() -> None:
     parser.add_argument("--skip-rankings", action="store_true", help="Skip ranking parser.")
     parser.add_argument("--skip-dataset", action="store_true", help="Skip final dataset build.")
     parser.add_argument("--skip-training", action="store_true", help="Skip model training.")
+    parser.add_argument("--continue-on-calendar-error", action="store_true", help="Continue with existing tournament master if RTT calendar is temporarily unavailable.")
     parser.add_argument("--check-only", action="store_true", help="Only check dependencies and exit.")
     args = parser.parse_args()
 
@@ -83,7 +84,12 @@ def main() -> None:
         return
 
     if not args.skip_calendar:
-        run_step("Update tournament ids and details from RTT calendar", [str(PROJECT_PYTHON), "-u", "scripts/parse_rtt_calendar.py"])
+        try:
+            run_step("Update tournament ids and details from RTT calendar", [str(PROJECT_PYTHON), "-u", "scripts/parse_rtt_calendar.py"])
+        except SystemExit:
+            if not args.continue_on_calendar_error:
+                raise
+            print("Warning: RTT calendar update failed; continuing with existing data/tournaments_master.xlsx.", flush=True)
 
     if not args.skip_matches:
         run_step("Download and parse RTT match pages", [str(PROJECT_PYTHON), "-u", "scripts/parse_rtt_matches.py"])
