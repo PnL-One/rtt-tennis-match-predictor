@@ -30,6 +30,7 @@ def main() -> None:
         root / "data" / "tournaments_master.xlsx",
         root / "data" / "data_manifest.json",
         root / "scripts" / "bootstrap_tournaments_master.py",
+        root / "scripts" / "parse_rtt_calendar.py",
         root / "scripts" / "data_status.py",
         root / "notebooks" / "00_data_control_panel.ipynb",
         root / "notebooks" / "01_save_and_parse_matches.ipynb",

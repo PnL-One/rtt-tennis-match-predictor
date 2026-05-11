@@ -11,6 +11,7 @@ env/
 # Parser raw outputs
 saved_rtt_pages/
 rtt_rankings_saved/
+data/calendar_debug/
 matches_saved/
 screenshots/
 
@@ -19,6 +20,7 @@ assembled_predictor/model_results/
 # Archives and logs
 *.zip
 *.log
+~$*.xlsx
 
 # Model binaries
 *.pkl
