@@ -18,6 +18,7 @@ def run_step(name: str, command: list[str]) -> None:
 
     env = os.environ.copy()
     env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONUNBUFFERED", "1")
     completed = subprocess.run(command, cwd=PROJECT_ROOT, env=env)
     if completed.returncode != 0:
         raise SystemExit(f"Step failed: {name} (exit code {completed.returncode})")
@@ -28,6 +29,7 @@ def run_notebook(path: Path) -> None:
         f"Execute {path.relative_to(PROJECT_ROOT)}",
         [
             sys.executable,
+            "-u",
             "-m",
             "jupyter",
             "nbconvert",
@@ -55,7 +57,7 @@ def main() -> None:
     print(f"Project root: {PROJECT_ROOT}")
 
     if not args.skip_calendar:
-        run_step("Update tournament ids and details from RTT calendar", [sys.executable, "scripts/parse_rtt_calendar.py"])
+        run_step("Update tournament ids and details from RTT calendar", [sys.executable, "-u", "scripts/parse_rtt_calendar.py"])
 
     if not args.skip_matches:
         run_notebook(NOTEBOOKS / "01_save_and_parse_matches.ipynb")
@@ -69,8 +71,8 @@ def main() -> None:
     if not args.skip_training:
         run_notebook(NOTEBOOKS / "04_train_final_model.ipynb")
 
-    run_step("Refresh data manifest", [sys.executable, "scripts/data_status.py", "--write-manifest"])
-    run_step("Verify project", [sys.executable, "scripts/verify_project.py"])
+    run_step("Refresh data manifest", [sys.executable, "-u", "scripts/data_status.py", "--write-manifest"])
+    run_step("Verify project", [sys.executable, "-u", "scripts/verify_project.py"])
 
     print("\nPipeline finished successfully.")
     print("Open notebooks/04_train_final_model.ipynb and use the final prediction widget for a specific match.")
