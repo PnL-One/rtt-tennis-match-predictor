@@ -294,7 +294,7 @@ async def auto_scroll_page(page) -> None:
 
         previous_height = new_height
 
-async def click_expand_buttons_if_any(page) -> None:
+async def click_expand_buttons_if_any(page, max_clicks: int = 8) -> None:
     possible_texts = [
         "Показать еще",
         "Показать ещё",
@@ -305,9 +305,12 @@ async def click_expand_buttons_if_any(page) -> None:
         "Подробнее",
     ]
 
+    clicks = 0
     for button_text in possible_texts:
         try:
             while True:
+                if clicks >= max_clicks:
+                    return
                 locator = page.get_by_text(button_text, exact=False)
                 count = await locator.count()
                 if count == 0:
@@ -318,6 +321,7 @@ async def click_expand_buttons_if_any(page) -> None:
                     break
 
                 await first_button.click(timeout=3000)
+                clicks += 1
                 await page.wait_for_timeout(1000)
         except Exception:
             pass
@@ -355,7 +359,7 @@ async def save_rendered_pages_from_excel(input_excel_path: str) -> pd.DataFrame:
                 html_path = HTML_DIR / f"{file_base}.html"
                 screenshot_path = SCREENSHOT_DIR / f"{file_base}.png"
 
-                print(f"[{i + 1}/{len(rows_to_process)}] {url}")
+                print(f"[{i + 1}/{len(rows_to_process)}] opening {url}", flush=True)
 
                 page = await context.new_page()
                 status = "ok"
@@ -365,20 +369,24 @@ async def save_rendered_pages_from_excel(input_excel_path: str) -> pd.DataFrame:
                     await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
 
                     try:
+                        print(f"[{i + 1}/{len(rows_to_process)}] waiting for rendered content", flush=True)
                         await page.wait_for_load_state("networkidle", timeout=15000)
                     except Exception:
                         pass
 
                     await page.wait_for_timeout(int(WAIT_AFTER_OPEN_SECONDS * 1000))
+                    print(f"[{i + 1}/{len(rows_to_process)}] expanding and scrolling", flush=True)
                     await click_expand_buttons_if_any(page)
                     await auto_scroll_page(page)
                     await click_expand_buttons_if_any(page)
                     await auto_scroll_page(page)
 
+                    print(f"[{i + 1}/{len(rows_to_process)}] saving html", flush=True)
                     html_content = await page.content()
                     html_path.write_text(html_content, encoding="utf-8")
 
                     try:
+                        print(f"[{i + 1}/{len(rows_to_process)}] saving screenshot", flush=True)
                         await page.screenshot(path=str(screenshot_path), full_page=True)
                     except Exception:
                         pass
