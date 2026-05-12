@@ -240,8 +240,8 @@ def build_rows_to_process(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
         elif row["_is_cancelled"]:
             skip_reason = "cancelled"
             save_status = "skipped_cancelled"
-        elif row["_is_completed"] and row["_matches_page_saved_bool"] and cached_html_path is not None:
-            skip_reason = "completed_cached"
+        elif cached_html_path is not None:
+            skip_reason = "cached_html"
             save_status = "ok"
             use_cached = True
 
