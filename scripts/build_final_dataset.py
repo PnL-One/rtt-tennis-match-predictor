@@ -577,7 +577,7 @@ def load_rating_history(rankings_csv_path: Path) -> pd.DataFrame:
     def date_column(*names: str) -> pd.Series:
         for name in names:
             if name in raw.columns:
-                return pd.to_datetime(raw[name], errors="coerce", dayfirst=True)
+                return pd.to_datetime(raw[name], errors="coerce", dayfirst=not name.endswith("_dt"))
         return pd.Series(pd.NaT, index=raw.index)
 
     rating_history = pd.DataFrame({
@@ -591,7 +591,7 @@ def load_rating_history(rankings_csv_path: Path) -> pd.DataFrame:
         "Из них зачетных": numeric_column("counting_tournaments_num", "counting_tournaments"),
         "Возрастная группа": text_column("age_group_filter", "age_group_in_table").map(normalize_age_group),
         "Очки": numeric_column("points_num", "points"),
-        "Дата классификации": date_column("ranking_date_dt", "ranking_date"),
+        "Дата классификации": date_column("ranking_date", "ranking_date_dt"),
     })
 
     rating_history = rating_history[

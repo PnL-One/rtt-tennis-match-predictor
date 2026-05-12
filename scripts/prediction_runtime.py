@@ -97,6 +97,24 @@ def normalize_age_group(value: object) -> str:
     return text
 
 
+def repair_month_start_ranking_dates(values: pd.Series) -> pd.Series:
+    dates = pd.to_datetime(values, errors="coerce", dayfirst=True)
+    valid = dates.notna()
+    swapped = valid & dates.dt.month.eq(1) & dates.dt.day.between(2, 12)
+    if swapped.any():
+        repaired = dates.copy()
+        repaired.loc[swapped] = pd.to_datetime(
+            {
+                "year": dates.loc[swapped].dt.year,
+                "month": dates.loc[swapped].dt.day,
+                "day": 1,
+            },
+            errors="coerce",
+        )
+        return repaired
+    return dates
+
+
 def player_options(bundle: dict[str, Any]) -> list[str]:
     long_feat = bundle["long_feat"]
     directory = (
@@ -776,7 +794,7 @@ def player_rating_history(bundle: dict[str, Any], player_id: str) -> pd.DataFram
             "Из них зачетных": "counting_tournaments",
         }
     )
-    result["classification_date"] = pd.to_datetime(result["classification_date"], errors="coerce")
+    result["classification_date"] = repair_month_start_ranking_dates(result["classification_date"])
     for col in ["points", "rank", "rated_tournaments", "counting_tournaments"]:
         if col in result.columns:
             result[col] = pd.to_numeric(result[col], errors="coerce")
