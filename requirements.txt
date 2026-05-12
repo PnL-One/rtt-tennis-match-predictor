@@ -1,5 +1,5 @@
-pandas
-numpy
+pandas<3
+numpy<2
 scikit-learn
 catboost
 matplotlib
