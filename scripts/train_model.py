@@ -41,6 +41,7 @@ from collections import defaultdict
 from pathlib import Path
 import re
 
+import joblib
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -3292,6 +3293,8 @@ catboost_mode_results_path = MODEL_SELECTION_DIR / "catboost_training_mode_selec
 main_model_diagnostics_path = MODEL_SELECTION_DIR / "main_model_train_test_diagnostics.csv"
 best_main_model_selection_path = MODEL_SELECTION_DIR / "best_main_model_selection.csv"
 sklearn_feature_importance_path = FEATURES_DIR / "sklearn_tree_feature_importance.csv"
+prediction_bundle_path = DATA_PATH.parent / "prediction_bundle.joblib"
+run_prediction_bundle_path = RUN_DIR / "prediction_bundle.joblib"
 
 metrics_table.to_csv(metrics_path, index=False)
 match_predictions_table.to_csv(match_predictions_path, index=False)
@@ -3308,6 +3311,32 @@ best_main_model_selection_table.to_csv(best_main_model_selection_path, index=Fal
 
 if "sklearn_feature_importance_table" in globals() and isinstance(sklearn_feature_importance_table, pd.DataFrame):
     sklearn_feature_importance_table.to_csv(sklearn_feature_importance_path, index=False)
+
+prediction_bundle = {
+    "created_at": pd.Timestamp.now().isoformat(),
+    "data_path": str(DATA_PATH),
+    "run_dir": str(RUN_DIR),
+    "model": production_main_model,
+    "model_name": production_main_model_name,
+    "selected_test_model": best_main_model_name,
+    "model_description": best_main_model_description,
+    "features": list(features),
+    "long_feat": long_feat.copy(),
+    "feature_catalog": feature_catalog_table.copy(),
+    "feature_importance": feature_importance_combined.copy(),
+    "sklearn_feature_importance": (
+        sklearn_feature_importance_table.copy()
+        if "sklearn_feature_importance_table" in globals() and isinstance(sklearn_feature_importance_table, pd.DataFrame)
+        else pd.DataFrame()
+    ),
+    "metrics": metrics_table.copy(),
+    "best_main_model_selection": best_main_model_selection_table.copy(),
+    "training_rows": production_model_training_rows,
+    "training_matches": production_model_training_matches,
+    "training_max_match_date": production_model_training_max_date,
+}
+joblib.dump(prediction_bundle, prediction_bundle_path)
+joblib.dump(prediction_bundle, run_prediction_bundle_path)
 
 if isinstance(rating_scale_grid, pd.DataFrame) and not rating_scale_grid.empty:
     rating_scale_grid.to_csv(rating_scale_grid_path, index=False)
@@ -3342,6 +3371,12 @@ if relative_rating_scale_grid_path.exists():
 
 if sklearn_feature_importance_path.exists():
     saved_files.append(sklearn_feature_importance_path)
+
+if prediction_bundle_path.exists():
+    saved_files.append(prediction_bundle_path)
+
+if run_prediction_bundle_path.exists():
+    saved_files.append(run_prediction_bundle_path)
 
 saved_files_table = pd.DataFrame({
     "group": [path.parent.name for path in saved_files],
