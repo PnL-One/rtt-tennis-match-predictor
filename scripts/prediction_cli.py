@@ -92,6 +92,8 @@ def predict_command(args: argparse.Namespace) -> None:
     timeline = pr.probability_timeline(bundle, args.player1, args.player2, date_value, periods=args.periods)
     player1_history = pr.player_history(bundle, player1_id, pd.Timestamp.max)
     player2_history = pr.player_history(bundle, player2_id, pd.Timestamp.max)
+    player1_rating_history = pr.player_rating_history(bundle, player1_id)
+    player2_rating_history = pr.player_rating_history(bundle, player2_id)
 
     payload = {
         "ok": True,
@@ -108,6 +110,8 @@ def predict_command(args: argparse.Namespace) -> None:
         "timeline": _records(timeline),
         "player1_history": _records(player1_history),
         "player2_history": _records(player2_history),
+        "player1_rating_history": _records(player1_rating_history),
+        "player2_rating_history": _records(player2_rating_history),
     }
     _write_json(payload)
 
@@ -125,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     predict.add_argument("--date", required=True)
     predict.add_argument("--age", default="__UNKNOWN_AGE__")
     predict.add_argument("--draw-type", default="__UNKNOWN_DRAW__")
-    predict.add_argument("--periods", type=int, default=28)
+    predict.add_argument("--periods", type=int, default=12)
     predict.set_defaults(func=predict_command)
 
     return parser

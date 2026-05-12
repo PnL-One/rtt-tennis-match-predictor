@@ -626,6 +626,10 @@ def load_source_data(path: Path, sheet_name: str = SHEET_NAME) -> pd.DataFrame:
 
 
 df_raw = load_source_data(DATA_PATH, SHEET_NAME)
+try:
+    rating_history_for_bundle = pd.read_excel(DATA_PATH, sheet_name="rating_history")
+except Exception:
+    rating_history_for_bundle = pd.DataFrame()
 DATA_MAX_MATCH_DATE = pd.Timestamp(df_raw["match_date"].max()).normalize()
 SPLIT_DATE = pd.Timestamp(DATA_MAX_MATCH_DATE - pd.DateOffset(months=TEST_LOOKBACK_MONTHS)).normalize()
 
@@ -3322,6 +3326,7 @@ prediction_bundle = {
     "model_description": best_main_model_description,
     "features": list(features),
     "long_feat": long_feat.copy(),
+    "rating_history": rating_history_for_bundle.copy(),
     "feature_catalog": feature_catalog_table.copy(),
     "feature_importance": feature_importance_combined.copy(),
     "sklearn_feature_importance": (
