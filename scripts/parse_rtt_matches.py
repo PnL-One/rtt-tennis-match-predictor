@@ -58,6 +58,7 @@ def Markdown(text):
 
 
 from datetime import date
+from io import StringIO
 from pathlib import Path
 import os
 import re
@@ -517,7 +518,7 @@ def flatten_json(obj: Any, parent_key: str = "", sep: str = ".") -> Dict[str, An
 def extract_tables_from_html(html_text: str) -> List[pd.DataFrame]:
     tables: List[pd.DataFrame] = []
     try:
-        candidate_tables = pd.read_html(html_text)
+        candidate_tables = pd.read_html(StringIO(html_text))
     except Exception:
         return tables
 

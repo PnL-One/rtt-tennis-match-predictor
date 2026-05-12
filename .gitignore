@@ -14,6 +14,9 @@ rtt_rankings_saved/
 data/calendar_debug/
 matches_saved/
 screenshots/
+rtt_matches_extracted.csv
+rtt_matches_extracted.xlsx
+rtt_failed_links.xlsx
 
 assembled_predictor/model_results/
 

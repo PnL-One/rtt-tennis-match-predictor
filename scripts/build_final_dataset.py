@@ -74,7 +74,9 @@ def find_project_root(start: Path | None = None) -> Path:
 
 PROJECT_ROOT = find_project_root()
 
+MATCHES_HTML_DIR = PROJECT_ROOT / "saved_rtt_pages" / "html"
 MATCHES_ZIP_PATH = PROJECT_ROOT / "saved_rtt_pages" / "matches.zip"
+MATCHES_SOURCE_PATH = MATCHES_HTML_DIR if MATCHES_HTML_DIR.exists() else MATCHES_ZIP_PATH
 RANKINGS_CSV_PATH = PROJECT_ROOT / "rtt_rankings_saved" / "rtt_rankings_all_dates.csv"
 
 # Необязательный файл. Используется только как источник уже проверенного player_matching.
@@ -385,6 +387,33 @@ def parse_match_rows_from_lines(lines: list[str], metadata: dict[str, Any]) -> l
     return rows
 
 
+def finalize_parsed_matches(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    result = pd.DataFrame(rows)
+
+    if result.empty:
+        return result
+
+    result["match_date"] = pd.to_datetime(result["match_date"], errors="coerce")
+    result["tournament_start_date"] = pd.to_datetime(result["tournament_start_date"], errors="coerce")
+
+    return result
+
+
+def parse_matches_html_dir(matches_html_dir: Path) -> pd.DataFrame:
+    matches_html_dir = as_path(matches_html_dir)
+    all_rows: list[dict[str, Any]] = []
+
+    html_paths = sorted(matches_html_dir.glob("*.html"))
+    for html_path in html_paths:
+        html_text = html_path.read_text(encoding="utf-8", errors="ignore")
+        lines = extract_lines_from_html(html_text)
+        metadata = parse_tournament_metadata(lines, html_path.name)
+        rows = parse_match_rows_from_lines(lines, metadata)
+        all_rows.extend(rows)
+
+    return finalize_parsed_matches(all_rows)
+
+
 def parse_matches_zip(matches_zip_path: Path) -> pd.DataFrame:
     matches_zip_path = as_path(matches_zip_path)
     all_rows: list[dict[str, Any]] = []
@@ -399,18 +428,23 @@ def parse_matches_zip(matches_zip_path: Path) -> pd.DataFrame:
             rows = parse_match_rows_from_lines(lines, metadata)
             all_rows.extend(rows)
 
-    result = pd.DataFrame(all_rows)
-
-    if result.empty:
-        return result
-
-    result["match_date"] = pd.to_datetime(result["match_date"], errors="coerce")
-    result["tournament_start_date"] = pd.to_datetime(result["tournament_start_date"], errors="coerce")
-
-    return result
+    return finalize_parsed_matches(all_rows)
 
 
-matches_parsed_raw = parse_matches_zip(MATCHES_ZIP_PATH)
+def parse_matches_source(matches_html_dir: Path, matches_zip_path: Path) -> pd.DataFrame:
+    matches_html_dir = as_path(matches_html_dir)
+    matches_zip_path = as_path(matches_zip_path)
+
+    if matches_html_dir.exists() and any(matches_html_dir.glob("*.html")):
+        html_count = len(list(matches_html_dir.glob("*.html")))
+        print(f"Parsing saved match HTML directory: {matches_html_dir} ({html_count} files)")
+        return parse_matches_html_dir(matches_html_dir)
+
+    print(f"Saved match HTML directory is empty; falling back to zip: {matches_zip_path}")
+    return parse_matches_zip(matches_zip_path)
+
+
+matches_parsed_raw = parse_matches_source(MATCHES_HTML_DIR, MATCHES_ZIP_PATH)
 
 print("Parsed raw match rows:", matches_parsed_raw.shape)
 display(matches_parsed_raw.head())
@@ -1122,7 +1156,8 @@ def write_final_predictor_file(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     build_summary = pd.DataFrame([
-        {"section": "input_files", "metric": "matches_zip_source", "value": str(MATCHES_ZIP_PATH)},
+        {"section": "input_files", "metric": "matches_source", "value": str(MATCHES_SOURCE_PATH)},
+        {"section": "input_files", "metric": "matches_zip_fallback", "value": str(MATCHES_ZIP_PATH)},
         {"section": "input_files", "metric": "rankings_csv_source", "value": str(RANKINGS_CSV_PATH)},
         {"section": "input_files", "metric": "existing_predictor_override", "value": str(EXISTING_PREDICTOR_PATH) if USE_EXISTING_PLAYER_MATCHING_AS_OVERRIDE else "not_used"},
         {"section": "output", "metric": "output_xlsx", "value": str(output_path)},
