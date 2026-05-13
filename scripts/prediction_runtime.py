@@ -729,6 +729,8 @@ def profiles_table(result: dict[str, Any]) -> pd.DataFrame:
             "Player": profile["player_name"],
             "Rank": profile["rank"],
             "Points": profile["points"],
+            "Rating date": profile["rating_date"],
+            "Rating age": profile["rating_age_group"],
             "ELO": round(profile["elo"], 1),
             "Matches": profile["matches"],
             "Wins": profile["wins"],
@@ -737,6 +739,7 @@ def profiles_table(result: dict[str, Any]) -> pd.DataFrame:
             "Form 10": profile["form10"],
             "Last match": profile["last_match_date"],
             "Rest days": profile["days_rest"],
+            "Avg opp ELO last 5": profile.get("avg_opp_elo_last5"),
             "H2H matches": profile.get("h2h_matches_before", 0),
             "H2H wins": profile.get("h2h_player_wins_before", 0),
         })
@@ -758,6 +761,204 @@ def player_history(bundle: dict[str, Any], player_id: str, prediction_date: pd.T
     ]
     cols = [col for col in cols if col in history.columns]
     return history[cols].drop_duplicates().copy()
+
+
+def player_recent_matches(
+    bundle: dict[str, Any],
+    player_id: str,
+    prediction_date: pd.Timestamp,
+    limit: int = 10,
+) -> pd.DataFrame:
+    history = player_history_rows(bundle["long_feat"], player_id, pd.Timestamp(prediction_date))
+    if history.empty:
+        return pd.DataFrame()
+
+    cols = [
+        "match_date",
+        "player_name",
+        "opponent_name",
+        "win",
+        "player_rank_pre",
+        "opponent_rank_pre",
+        "player_points_pre",
+        "opponent_points_pre",
+        "elo_pre",
+        "elo_opp_pre",
+        "tournament_name",
+        "tournament_city",
+    ]
+    cols = [col for col in cols if col in history.columns]
+    result = (
+        history.sort_values(["match_date", "match_id"])
+        .drop_duplicates(subset=["match_id"], keep="last")
+        .tail(limit)
+        .sort_values(["match_date", "opponent_name"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    return result[cols].copy()
+
+
+def h2h_detail(
+    long_feat: pd.DataFrame,
+    player_a_id: str,
+    player_b_id: str,
+    prediction_date: pd.Timestamp,
+) -> pd.DataFrame:
+    prediction_date = pd.Timestamp(prediction_date)
+    player_ids = long_feat["player_id"].astype(str)
+    opponent_ids = long_feat["opponent_id"].astype(str)
+    mask = (
+        (
+            player_ids.eq(str(player_a_id))
+            & opponent_ids.eq(str(player_b_id))
+        )
+        | (
+            player_ids.eq(str(player_b_id))
+            & opponent_ids.eq(str(player_a_id))
+        )
+    )
+    if "match_date" in long_feat.columns:
+        mask &= pd.to_datetime(long_feat["match_date"], errors="coerce") < prediction_date
+
+    cols = [
+        "match_date",
+        "player_name",
+        "opponent_name",
+        "win",
+        "tournament_name",
+        "tournament_city",
+        "elo_pre",
+        "elo_opp_pre",
+        "elo_diff",
+        "player_points_pre",
+        "opponent_points_pre",
+        "diff_points_pre_observed_only",
+        "rel_diff_points_pct_min_pre_observed_only",
+        "player_points_per_counting_tournament_pre",
+        "opponent_points_per_counting_tournament_pre",
+        "diff_points_per_counting_tournament_pre_observed_only",
+        "rel_diff_points_per_counting_tournament_pct_min_pre_observed_only",
+        "player_rank_pre",
+        "opponent_rank_pre",
+        "diff_rank_pre_observed_only",
+    ]
+    cols = [col for col in cols if col in long_feat.columns]
+    return (
+        long_feat.loc[mask, cols]
+        .sort_values(["match_date", "player_name"])
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+
+def common_opponents_report(
+    long_feat: pd.DataFrame,
+    player_a_id: str,
+    player_b_id: str,
+    prediction_date: pd.Timestamp,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    prediction_date = pd.Timestamp(prediction_date)
+    history = long_feat[pd.to_datetime(long_feat["match_date"], errors="coerce") < prediction_date].copy()
+    if history.empty:
+        return pd.DataFrame(), pd.DataFrame(), {
+            "n_common_opponents": 0,
+            "common_opponents_edge": np.nan,
+            "common_opponents_pseudo_probability_a": np.nan,
+            "direct_model_feature": True,
+        }
+
+    history["player_id"] = history["player_id"].astype(str)
+    history["opponent_id"] = history["opponent_id"].astype(str)
+    a_history = history[history["player_id"].eq(str(player_a_id))].copy()
+    b_history = history[history["player_id"].eq(str(player_b_id))].copy()
+    common_opponents = sorted(set(a_history["opponent_id"]) & set(b_history["opponent_id"]))
+
+    summary_rows = []
+    detail_rows = []
+    keep_cols = [
+        "match_date",
+        "player_name",
+        "opponent_name",
+        "win",
+        "tournament_name",
+        "tournament_city",
+        "elo_pre",
+        "elo_opp_pre",
+        "player_rank_pre",
+        "opponent_rank_pre",
+        "player_points_pre",
+        "opponent_points_pre",
+    ]
+    keep_cols = [col for col in keep_cols if col in history.columns]
+
+    for common_id in common_opponents:
+        a_vs = a_history[a_history["opponent_id"].eq(common_id)].drop_duplicates(subset=["match_id"]).copy()
+        b_vs = b_history[b_history["opponent_id"].eq(common_id)].drop_duplicates(subset=["match_id"]).copy()
+        if a_vs.empty or b_vs.empty:
+            continue
+
+        common_name_series = pd.concat([a_vs["opponent_name"], b_vs["opponent_name"]]).dropna().astype(str)
+        common_name = common_name_series.iloc[-1] if not common_name_series.empty else common_id
+
+        a_n = int(a_vs["match_id"].nunique())
+        b_n = int(b_vs["match_id"].nunique())
+        a_wins = int(pd.to_numeric(a_vs["win"], errors="coerce").fillna(0).sum())
+        b_wins = int(pd.to_numeric(b_vs["win"], errors="coerce").fillna(0).sum())
+        a_winrate = float(pd.to_numeric(a_vs["win"], errors="coerce").mean())
+        b_winrate = float(pd.to_numeric(b_vs["win"], errors="coerce").mean())
+        edge = a_winrate - b_winrate
+
+        last_date = max(pd.Timestamp(a_vs["match_date"].max()), pd.Timestamp(b_vs["match_date"].max()))
+        days_ago = max((prediction_date - last_date).days, 0)
+        recency_weight = float(np.exp(-days_ago / COMMON_OPP_HALF_LIFE_DAYS))
+        sample_weight = float(np.sqrt(min(a_n, b_n)))
+        weight = recency_weight * sample_weight
+
+        summary_rows.append({
+            "common_opponent_id": common_id,
+            "common_opponent_name": common_name,
+            "player_a_matches_vs_common": a_n,
+            "player_a_wins_vs_common": a_wins,
+            "player_a_winrate_vs_common": a_winrate,
+            "player_b_matches_vs_common": b_n,
+            "player_b_wins_vs_common": b_wins,
+            "player_b_winrate_vs_common": b_winrate,
+            "winrate_edge_a_minus_b": edge,
+            "days_ago": days_ago,
+            "weight": weight,
+            "weighted_edge": weight * edge,
+        })
+
+        for side, side_df in [("player_a", a_vs), ("player_b", b_vs)]:
+            tmp = side_df[keep_cols].copy()
+            tmp["side"] = side
+            tmp["common_opponent_id"] = common_id
+            tmp["common_opponent_name"] = common_name
+            detail_rows.append(tmp)
+
+    summary_df = pd.DataFrame(summary_rows)
+    detail_df = pd.concat(detail_rows, ignore_index=True) if detail_rows else pd.DataFrame()
+    if not summary_df.empty and summary_df["weight"].sum() > 0:
+        weighted_edge = float(summary_df["weighted_edge"].sum() / summary_df["weight"].sum())
+    else:
+        weighted_edge = np.nan
+
+    signal = {
+        "n_common_opponents": int(len(summary_df)),
+        "common_opponents_edge": weighted_edge,
+        "common_opponents_pseudo_probability_a": (
+            float(np.clip(0.5 + 0.5 * weighted_edge, 0.0, 1.0))
+            if pd.notna(weighted_edge)
+            else np.nan
+        ),
+        "direct_model_feature": True,
+    }
+
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values(["weight", "days_ago"], ascending=[False, True]).reset_index(drop=True)
+    if not detail_df.empty:
+        detail_df = detail_df.sort_values(["common_opponent_name", "match_date", "side"]).reset_index(drop=True)
+    return summary_df, detail_df, signal
 
 
 def player_rating_history(bundle: dict[str, Any], player_id: str) -> pd.DataFrame:

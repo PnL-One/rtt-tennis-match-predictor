@@ -43,10 +43,21 @@ def _records(df: pd.DataFrame, limit: int | None = None) -> list[dict[str, Any]]
     return out.to_dict(orient="records")
 
 
+def _clean_json_scalars(payload: dict[str, Any]) -> dict[str, Any]:
+    cleaned = {}
+    for key, value in payload.items():
+        try:
+            is_missing = bool(pd.isna(value))
+        except (TypeError, ValueError):
+            is_missing = False
+        cleaned[key] = None if is_missing else value
+    return cleaned
+
+
 def _write_json(payload: dict[str, Any]) -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    print(json.dumps(payload, ensure_ascii=False, default=_json_default))
+    print(json.dumps(payload, ensure_ascii=False, default=_json_default, allow_nan=False))
 
 
 def players_command(_: argparse.Namespace) -> None:
@@ -90,10 +101,20 @@ def predict_command(args: argparse.Namespace) -> None:
     player2_id = result["player2_lookup"]["player_id"]
     date_value = pd.Timestamp(args.date)
     timeline = pr.probability_timeline(bundle, args.player1, args.player2, date_value, periods=args.periods)
-    player1_history = pr.player_history(bundle, player1_id, pd.Timestamp.max)
-    player2_history = pr.player_history(bundle, player2_id, pd.Timestamp.max)
+    player1_history = pr.player_history(bundle, player1_id, date_value)
+    player2_history = pr.player_history(bundle, player2_id, date_value)
+    player1_last10 = pr.player_recent_matches(bundle, player1_id, date_value)
+    player2_last10 = pr.player_recent_matches(bundle, player2_id, date_value)
     player1_rating_history = pr.player_rating_history(bundle, player1_id)
     player2_rating_history = pr.player_rating_history(bundle, player2_id)
+    h2h_detail = pr.h2h_detail(bundle["long_feat"], player1_id, player2_id, date_value)
+    common_summary, common_detail, common_signal = pr.common_opponents_report(
+        bundle["long_feat"],
+        player1_id,
+        player2_id,
+        date_value,
+    )
+    common_signal = _clean_json_scalars(common_signal)
 
     payload = {
         "ok": True,
@@ -102,6 +123,7 @@ def predict_command(args: argparse.Namespace) -> None:
         "player2_name": result["player2_lookup"]["player_name"],
         "player1_id": player1_id,
         "player2_id": player2_id,
+        "prediction_date": date_value,
         "p_player1_win": result["p_player1_win"],
         "p_player2_win": result["p_player2_win"],
         "profiles": _records(pr.profiles_table(result)),
@@ -110,8 +132,14 @@ def predict_command(args: argparse.Namespace) -> None:
         "timeline": _records(timeline),
         "player1_history": _records(player1_history),
         "player2_history": _records(player2_history),
+        "player1_last10": _records(player1_last10),
+        "player2_last10": _records(player2_last10),
         "player1_rating_history": _records(player1_rating_history),
         "player2_rating_history": _records(player2_rating_history),
+        "h2h_detail": _records(h2h_detail),
+        "common_summary": _records(common_summary),
+        "common_detail": _records(common_detail, limit=120),
+        "common_signal": common_signal,
     }
     _write_json(payload)
 
