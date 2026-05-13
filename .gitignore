@@ -25,6 +25,7 @@ model_results/
 *.zip
 *.log
 ~$*.xlsx
+docs/RTT_tennis_match_predictor_presentation.pptx
 
 # Model binaries
 *.pkl
