@@ -38,8 +38,14 @@ def Markdown(text):
 # 
 # Ключевая методологическая идея: модель обучается в perspective-формате — каждый матч представлен двумя строками, с точки зрения каждого игрока. Для практического прогноза по паре игроков итоговая вероятность рассчитывается на уровне матча через симметризацию двух прогнозов: `A vs B` и `B vs A`.
 from collections import defaultdict
+from itertools import product
 from pathlib import Path
+from time import perf_counter
+import argparse
+import json
+import os
 import re
+import sys
 
 import joblib
 import numpy as np
@@ -52,7 +58,7 @@ from catboost import CatBoostClassifier, Pool
 from sklearn.calibration import calibration_curve
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     brier_score_loss,
@@ -62,6 +68,17 @@ from sklearn.metrics import (
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+PROJECT_IMPORT_ROOT = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
+if str(PROJECT_IMPORT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_IMPORT_ROOT))
+
+from rtt_predictor.model_wrappers import (
+    ProbabilityCalibratedModel,
+    apply_sigmoid_calibrator,
+    fit_sigmoid_calibrator,
+    unwrap_base_model,
+)
 
 
 # ---------------------------------------------------------------------
@@ -79,15 +96,45 @@ PROJECT_ROOT = find_project_root()
 
 DATA_PATH = PROJECT_ROOT / "assembled_predictor" / "predictor_model_dataset_from_parsers.xlsx"
 SHEET_NAME = "ml_dataset"
+MODEL_SELECTION_SETTINGS_PATH = DATA_PATH.parent / "model_selection_settings.json"
+
+
+def parse_training_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train RTT match prediction models.")
+    parser.add_argument(
+        "--model-selection-mode",
+        choices=["reuse", "recalibrate"],
+        default="reuse",
+        help=(
+            "reuse: use the latest saved model-selection settings when available; "
+            "recalibrate: rerun CatBoost/GBM/RF time-based grid search."
+        ),
+    )
+    parser.add_argument(
+        "--model-selection-settings",
+        type=Path,
+        default=MODEL_SELECTION_SETTINGS_PATH,
+        help="Path to JSON with latest selected model settings.",
+    )
+    args, _ = parser.parse_known_args()
+    return args
+
+
+TRAINING_ARGS = parse_training_args()
+MODEL_SELECTION_MODE = TRAINING_ARGS.model_selection_mode
+MODEL_SELECTION_SETTINGS_PATH = TRAINING_ARGS.model_selection_settings
 
 print(f"PROJECT_ROOT: {PROJECT_ROOT}")
+print(f"Model selection mode: {MODEL_SELECTION_MODE}")
+print(f"Model selection settings: {MODEL_SELECTION_SETTINGS_PATH}")
 
 # Временное разделение: train строго до даты, test начиная с даты.
 TEST_LOOKBACK_MONTHS = 3
 SPLIT_DATE: pd.Timestamp | None = None
 
 # Внутренняя validation-часть внутри train-периода.
-# Используется только для выбора best_iteration CatBoost и шкалы rating_only.
+# Используется для grid search CatBoost/GBM/RF, калибровки вероятностей
+# и подбора шкал rating_only.
 DEV_VALID_FRACTION = 0.20
 
 # Воспроизводимость обучения и SHAP sampling.
@@ -115,69 +162,33 @@ COMMON_OPP_HALF_LIFE_DAYS = 180.0   #параметр давности для п
                                     #показывает горизонт, на котором влияние старого результата уже заметно снижается, но не исчезает полностью
 
 
-# CatBoost: три режима обучения финальной модели.
-# Выбор режима выполняется автоматически по внутренней validation-выборке.
-#
-# Логика выбора:
-# 1) считаем validation LogLoss для каждого режима;
-# 2) находим лучший validation LogLoss;
-# 3) если несколько режимов находятся в пределах MODEL_SELECTION_VALID_TOLERANCE
-#    от лучшего результата, выбираем вариант с меньшим train-valid gap;
-# 4) при равенстве выбираем более простой режим.
-#
-# Это позволяет не переусложнять модель, если более тяжелый режим не дает
-# содержательного прироста на validation.
-
-MODEL_SELECTION_VALID_TOLERANCE = 0.0025        #порог, при котором результаты разных режимов по метрике LogLoss считаются практически сопоставимыми,
-                                                #что приводит к выбору режима с меньшим разрывом между train и validation
-
 CATBOOST_COMMON_PARAMS = dict(
     loss_function="Logloss",            #функция потерь для обучения бинарной классификации,LogLoss, т.к. она штрафует не только неправильный класс, но и плохую оценку вероятности
     eval_metric="Logloss",              #метрика для контроля качества на validation-выборке (та же метрика, что и в обучении, чтобы выбирать модель именно по качеству вероятностного прогноза)
     random_seed=RANDOM_SEED,
     verbose=False,                      #отключаем подробный лог обучения, чтобы не загромождать ноутбук
+    allow_writing_files=False,          #не создаем служебную папку catboost_info: эти логи дальше не используются
     thread_count=1,                     #обучаем в один поток - медленнее, но лучше воспроизводимость результатов
     od_type="Iter",                     #включаем early stopping по числу итераций:
                                         #если качество на validation перестает улучшаться в течение заданного числа итераций (od_wait, см. ниже), обучение останавливается
                                         #это помогает не переобучать модель
 )
 
-CATBOOST_TRAINING_MODES = {
-    "light": {
-        **CATBOOST_COMMON_PARAMS,
-        "iterations": 1200,             #максимальное число деревьев
-        "learning_rate": 0.03,          #скорость обучения, при высоком значении модели нужно меньше деревьев
-        "depth": 6,                     #глубина деревьев, при умеренной сложности модель может ловить нелинейности, но не становится слишком тяжелой 
-        "l2_leaf_reg": 5.0,             #L2-регуляризация листьев дерева, помогает снизить вероятность переобучения
-        "od_wait": 150,                 #Early stopping: если validation LogLoss не улучшается 150 итераций, обучение останавливается
-        "complexity_rank": 1,
-        "description": "Быстрый режим: компактная модель для контрольного запуска.",
-    },
-    "balanced": {
-        **CATBOOST_COMMON_PARAMS,
-        "iterations": 3500,
-        "learning_rate": 0.018,
-        "depth": 6,
-        "l2_leaf_reg": 8.0,
-        "od_wait": 300,
-        "complexity_rank": 2,
-        "description": "Сбалансированный режим: больше деревьев и ниже learning rate.",
-    },
-    "power": {
-        **CATBOOST_COMMON_PARAMS,
-        "iterations": 6000,
-        "learning_rate": 0.012,
-        "depth": 7,
-        "l2_leaf_reg": 10.0,
-        "od_wait": 400,
-        "complexity_rank": 3,
-        "description": "Мощный режим: более глубокие деревья и больше итераций.",
-    },
+CATBOOST_PARAM_GRID = {
+    "iterations": [1200, 2500, 4000],
+    "learning_rate": [0.012, 0.018, 0.03, 0.045],
+    "depth": [5, 6, 7],
+    "l2_leaf_reg": [3.0, 8.0],
+    "od_wait": [200],
 }
 
 
 # Дополнительные основные модели для сравнения с CatBoost.
 # Они обучаются на том же полном наборе признаков, что и CatBoost.
+# Параметры GBM и Random Forest подбираются на внутреннем time-based validation
+# внутри train-периода. Final test не используется для подбора гиперпараметров.
+SKLEARN_SEARCH_N_JOBS = min(12, max(1, (os.cpu_count() or 1) // 2))
+
 GBM_PARAMS = dict(
     n_estimators=700,               #число деревьев в градиентном бустинге
     learning_rate=0.025,            #скорость обучения; ниже скорость — плавнее обучение
@@ -187,20 +198,86 @@ GBM_PARAMS = dict(
     random_state=RANDOM_SEED,
 )
 
+GBM_PARAM_GRID = {
+    "n_estimators": [250, 350, 450, 550, 700, 900],
+    "learning_rate": [0.025, 0.0325, 0.04, 0.05, 0.06],
+    "max_depth": [2, 3, 4],
+    "min_samples_leaf": [5, 8, 10, 15],
+    "subsample": [0.75, 0.85, 1.0],
+}
+
 RANDOM_FOREST_PARAMS = dict(
     n_estimators=700,               #число деревьев случайного леса
     max_depth=None,                 #глубину не ограничиваем жестко, но ограничиваем листья ниже
     min_samples_leaf=5,             #защита от слишком мелких листьев и переобучения
     max_features="sqrt",            #каждое дерево/разбиение использует подмножество признаков
     class_weight="balanced_subsample",
-    n_jobs=-1,                      #используем доступные ядра процессора
+    n_jobs=SKLEARN_SEARCH_N_JOBS,   #оставляем запас потоков для системы и ноутбука
     random_state=RANDOM_SEED,
 )
+
+RANDOM_FOREST_PARAM_GRID = {
+    "n_estimators": [500],
+    "max_depth": [None, 8, 10, 12, 16, 20, 24],
+    "min_samples_leaf": [2, 4, 6, 8, 10, 15],
+    "max_features": ["sqrt", "log2", 0.3, 0.5, 0.7],
+    "class_weight": [None, "balanced_subsample"],
+}
+RANDOM_FOREST_FINAL_N_ESTIMATORS = 1000
+RANDOM_FOREST_TOP_CANDIDATES_FOR_FINAL_TREES = 5
 
 #сетки параметров для перевода рейтинговой разницы в вероятность победы в простых benchmark-моделях
 RATING_SCALE_GRID = np.array([50, 75, 100, 125, 150, 175, 200, 250, 300, 400], dtype=float)
 ADJUSTED_RATING_SCALE_GRID = np.array([10, 15, 20, 25, 30, 40, 50, 75, 100, 125, 150, 200, 250], dtype=float)
 RELATIVE_RATING_SCALE_GRID = np.array([25, 50, 75, 100, 150, 200, 250, 300, 400, 500, 750, 1000], dtype=float)
+
+
+def load_model_selection_settings(path: Path) -> dict | None:
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception as exc:
+        print(f"Warning: failed to load model selection settings from {path}: {exc}")
+        return None
+
+
+def normalize_json_params(params: dict | None) -> dict:
+    params = dict(params or {})
+    normalized = {}
+    for key, value in params.items():
+        if isinstance(value, float) and np.isnan(value):
+            normalized[key] = None
+        else:
+            normalized[key] = value
+    return normalized
+
+
+def json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return None if np.isnan(value) else float(value)
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+SAVED_MODEL_SELECTION_SETTINGS = load_model_selection_settings(MODEL_SELECTION_SETTINGS_PATH)
+REUSE_MODEL_SELECTION_SETTINGS = MODEL_SELECTION_MODE == "reuse" and SAVED_MODEL_SELECTION_SETTINGS is not None
+
+if MODEL_SELECTION_MODE == "reuse" and SAVED_MODEL_SELECTION_SETTINGS is None:
+    print("No saved model-selection settings found; falling back to recalibration.")
+if REUSE_MODEL_SELECTION_SETTINGS:
+    print("Using saved model-selection settings for a faster training run.")
 
 
 # ## Расчет ELO в модели
@@ -1601,6 +1678,331 @@ def predict_sklearn_main_model(model: Pipeline, X: pd.DataFrame) -> np.ndarray:
     return model.predict_proba(X)[:, 1]
 
 
+def iter_param_grid(param_grid: dict) -> list[dict]:
+    keys = list(param_grid.keys())
+    values = [param_grid[key] for key in keys]
+    return [dict(zip(keys, combination)) for combination in product(*values)]
+
+
+def format_param_dict(params: dict) -> str:
+    return ", ".join(f"{key}={value}" for key, value in params.items())
+
+
+def gbm_complexity_score(params: dict) -> float:
+    return float(params["n_estimators"] * (2 ** params["max_depth"]) / params["min_samples_leaf"])
+
+
+def random_forest_complexity_score(params: dict) -> float:
+    depth = params["max_depth"] if params["max_depth"] is not None else 64
+    max_features = params["max_features"]
+    if max_features == "sqrt":
+        max_features_score = 1.0
+    elif max_features == "log2":
+        max_features_score = 0.8
+    else:
+        max_features_score = float(max_features)
+    return float(params["n_estimators"] * depth * max_features_score / params["min_samples_leaf"])
+
+
+def evaluate_sklearn_candidate(
+    *,
+    candidate_id: str,
+    model_name: str,
+    stage: str,
+    estimator,
+    params: dict,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_valid: pd.DataFrame,
+    y_valid: pd.Series,
+    complexity_score: float,
+) -> tuple[dict, Pipeline]:
+    started_at = perf_counter()
+    model = fit_sklearn_main_model(estimator, X_train, y_train)
+    fit_seconds = perf_counter() - started_at
+
+    p_train = predict_sklearn_main_model(model, X_train)
+    p_valid = predict_sklearn_main_model(model, X_valid)
+    train_metrics = metrics_dict(y_train.to_numpy(), p_train)
+    valid_metrics = metrics_dict(y_valid.to_numpy(), p_valid)
+
+    row = {
+        "candidate_id": candidate_id,
+        "model_name": model_name,
+        "stage": stage,
+        "params": format_param_dict(params),
+        "fit_seconds": fit_seconds,
+        "complexity_score": complexity_score,
+        "train_logloss": train_metrics["logloss"],
+        "valid_logloss": valid_metrics["logloss"],
+        "train_valid_logloss_gap": valid_metrics["logloss"] - train_metrics["logloss"],
+        "train_brier": train_metrics["brier"],
+        "valid_brier": valid_metrics["brier"],
+        "train_roc_auc": train_metrics["roc_auc"],
+        "valid_roc_auc": valid_metrics["roc_auc"],
+        "train_accuracy": train_metrics["accuracy"],
+        "valid_accuracy": valid_metrics["accuracy"],
+        "train_n_obs": train_metrics["n_obs"],
+        "valid_n_obs": valid_metrics["n_obs"],
+        "selected": False,
+    }
+    for key, value in params.items():
+        row[f"param_{key}"] = value
+    return row, model
+
+
+def evaluate_probability_candidate(
+    *,
+    candidate_id: str,
+    model_name: str,
+    stage: str,
+    params: dict,
+    p_train: np.ndarray,
+    p_valid: np.ndarray,
+    y_train: pd.Series,
+    y_valid: pd.Series,
+    fit_seconds: float,
+    complexity_score: float,
+) -> dict:
+    train_metrics = metrics_dict(y_train.to_numpy(), p_train)
+    valid_metrics = metrics_dict(y_valid.to_numpy(), p_valid)
+    row = {
+        "candidate_id": candidate_id,
+        "model_name": model_name,
+        "stage": stage,
+        "params": format_param_dict(params),
+        "fit_seconds": fit_seconds,
+        "complexity_score": complexity_score,
+        "train_logloss": train_metrics["logloss"],
+        "valid_logloss": valid_metrics["logloss"],
+        "train_valid_logloss_gap": valid_metrics["logloss"] - train_metrics["logloss"],
+        "train_brier": train_metrics["brier"],
+        "valid_brier": valid_metrics["brier"],
+        "train_roc_auc": train_metrics["roc_auc"],
+        "valid_roc_auc": valid_metrics["roc_auc"],
+        "train_accuracy": train_metrics["accuracy"],
+        "valid_accuracy": valid_metrics["accuracy"],
+        "train_n_obs": train_metrics["n_obs"],
+        "valid_n_obs": valid_metrics["n_obs"],
+        "selected": False,
+    }
+    for key, value in params.items():
+        row[f"param_{key}"] = value
+    return row
+
+
+def sort_tuning_results(table: pd.DataFrame) -> pd.DataFrame:
+    return (
+        table
+        .sort_values(
+            ["valid_logloss", "valid_brier", "valid_roc_auc", "complexity_score"],
+            ascending=[True, True, False, True],
+        )
+        .reset_index(drop=True)
+    )
+
+
+def tune_gbm_model(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_valid: pd.DataFrame,
+    y_valid: pd.Series,
+) -> tuple[dict, pd.DataFrame]:
+    n_estimators_grid = sorted(GBM_PARAM_GRID["n_estimators"])
+    max_n_estimators = max(n_estimators_grid)
+    fit_grid = {
+        key: value
+        for key, value in GBM_PARAM_GRID.items()
+        if key != "n_estimators"
+    }
+    fit_candidates = iter_param_grid(fit_grid)
+    candidate_count = len(fit_candidates) * len(n_estimators_grid)
+    rows = []
+    params_by_candidate_id = {}
+
+    for fit_idx, base_grid_params in enumerate(fit_candidates, start=1):
+        fit_params = {
+            **base_grid_params,
+            "n_estimators": max_n_estimators,
+            "random_state": RANDOM_SEED,
+        }
+        print(
+            f"Tuning GBM staged fit [{fit_idx}/{len(fit_candidates)}]: "
+            f"{format_param_dict(fit_params)}"
+        )
+
+        started_at = perf_counter()
+        model = fit_sklearn_main_model(
+            GradientBoostingClassifier(**fit_params),
+            X_train,
+            y_train,
+        )
+        fit_seconds = perf_counter() - started_at
+
+        train_stage_predictions = {
+            step_idx: probabilities[:, 1]
+            for step_idx, probabilities in enumerate(
+                model.named_steps["model"].staged_predict_proba(model.named_steps["imputer"].transform(X_train)),
+                start=1,
+            )
+            if step_idx in n_estimators_grid
+        }
+        valid_stage_predictions = {
+            step_idx: probabilities[:, 1]
+            for step_idx, probabilities in enumerate(
+                model.named_steps["model"].staged_predict_proba(model.named_steps["imputer"].transform(X_valid)),
+                start=1,
+            )
+            if step_idx in n_estimators_grid
+        }
+
+        for n_estimators in n_estimators_grid:
+            params = {
+                **base_grid_params,
+                "n_estimators": n_estimators,
+                "random_state": RANDOM_SEED,
+            }
+            candidate_id = f"gbm_{len(rows) + 1:03d}"
+            params_by_candidate_id[candidate_id] = params
+            row = evaluate_probability_candidate(
+                candidate_id=candidate_id,
+                model_name="final_gbm",
+                stage="validation_staged_grid",
+                params=params,
+                p_train=train_stage_predictions[n_estimators],
+                p_valid=valid_stage_predictions[n_estimators],
+                y_train=y_train,
+                y_valid=y_valid,
+                fit_seconds=fit_seconds / len(n_estimators_grid),
+                complexity_score=gbm_complexity_score(params),
+            )
+            rows.append(row)
+            print(
+                f"  GBM staged candidate [{len(rows)}/{candidate_count}]: "
+                f"n_estimators={n_estimators}, valid_logloss={row['valid_logloss']:.6f}"
+            )
+
+    table = sort_tuning_results(pd.DataFrame(rows))
+    selected_candidate_id = str(table.iloc[0]["candidate_id"])
+    table["selected"] = table["candidate_id"] == selected_candidate_id
+    return params_by_candidate_id[selected_candidate_id], table
+
+
+def tune_random_forest_model(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_valid: pd.DataFrame,
+    y_valid: pd.Series,
+) -> tuple[dict, pd.DataFrame]:
+    candidates = iter_param_grid(RANDOM_FOREST_PARAM_GRID)
+    rows = []
+    params_by_candidate_id = {}
+
+    for idx, grid_params in enumerate(candidates, start=1):
+        params = {
+            **grid_params,
+            "n_jobs": SKLEARN_SEARCH_N_JOBS,
+            "random_state": RANDOM_SEED,
+        }
+        candidate_id = f"rf_search_{idx:03d}"
+        params_by_candidate_id[candidate_id] = params
+        print(f"Tuning Random Forest search [{idx}/{len(candidates)}]: {format_param_dict(grid_params)}")
+
+        row, _ = evaluate_sklearn_candidate(
+            candidate_id=candidate_id,
+            model_name="final_random_forest",
+            stage="validation_grid_500_trees",
+            estimator=RandomForestClassifier(**params),
+            params=params,
+            X_train=X_train,
+            y_train=y_train,
+            X_valid=X_valid,
+            y_valid=y_valid,
+            complexity_score=random_forest_complexity_score(params),
+        )
+        rows.append(row)
+
+    search_table = sort_tuning_results(pd.DataFrame(rows))
+    top_candidate_ids = search_table.head(RANDOM_FOREST_TOP_CANDIDATES_FOR_FINAL_TREES)["candidate_id"].tolist()
+
+    final_rows = []
+    for idx, base_candidate_id in enumerate(top_candidate_ids, start=1):
+        base_params = params_by_candidate_id[base_candidate_id]
+        params = {
+            **base_params,
+            "n_estimators": RANDOM_FOREST_FINAL_N_ESTIMATORS,
+        }
+        candidate_id = f"rf_final_{idx:03d}"
+        params_by_candidate_id[candidate_id] = params
+        print(
+            "Tuning Random Forest final trees "
+            f"[{idx}/{len(top_candidate_ids)}]: from {base_candidate_id}, "
+            f"{format_param_dict(params)}"
+        )
+
+        row, _ = evaluate_sklearn_candidate(
+            candidate_id=candidate_id,
+            model_name="final_random_forest",
+            stage="validation_top_refit_1000_trees",
+            estimator=RandomForestClassifier(**params),
+            params=params,
+            X_train=X_train,
+            y_train=y_train,
+            X_valid=X_valid,
+            y_valid=y_valid,
+            complexity_score=random_forest_complexity_score(params),
+        )
+        final_rows.append(row)
+
+    full_table = pd.concat([search_table, pd.DataFrame(final_rows)], ignore_index=True)
+    selection_table = sort_tuning_results(pd.DataFrame(final_rows) if final_rows else search_table)
+    selected_candidate_id = str(selection_table.iloc[0]["candidate_id"])
+    full_table["selected"] = full_table["candidate_id"] == selected_candidate_id
+    full_table = full_table.sort_values(
+        ["selected", "stage", "valid_logloss", "valid_brier", "valid_roc_auc"],
+        ascending=[False, True, True, True, False],
+    ).reset_index(drop=True)
+    return params_by_candidate_id[selected_candidate_id], full_table
+
+
+def fit_linear_regression_model(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+) -> Pipeline:
+    model = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+        ("model", LinearRegression()),
+    ])
+    model.fit(X_train, y_train)
+    return model
+
+
+def predict_linear_regression_model(model: Pipeline, X: pd.DataFrame) -> np.ndarray:
+    return clip_prob(model.predict(X))
+
+
+def build_train_test_probability_diagnostic_row(
+    model_name: str,
+    y_train: pd.Series,
+    p_train: np.ndarray,
+    y_test: pd.Series,
+    p_test: np.ndarray,
+) -> dict:
+    train_metrics = metrics_dict(y_train.to_numpy(), p_train)
+    test_metrics = metrics_dict(y_test.to_numpy(), p_test)
+    return {
+        "model_name": model_name,
+        "train_logloss": train_metrics["logloss"],
+        "test_logloss": test_metrics["logloss"],
+        "train_test_logloss_gap": test_metrics["logloss"] - train_metrics["logloss"],
+        "train_roc_auc": train_metrics["roc_auc"],
+        "test_roc_auc": test_metrics["roc_auc"],
+        "train_brier": train_metrics["brier"],
+        "test_brier": test_metrics["brier"],
+    }
+
+
 def fit_production_main_model(
     model_name: str,
     X_all: pd.DataFrame,
@@ -1614,23 +2016,32 @@ def fit_production_main_model(
     model selection is finished.
     """
     if model_name == "final_catboost":
-        return fit_final_catboost(
+        base_model = fit_final_catboost(
             X_train=X_all,
             y_train=y_all,
-            selected_mode_name=selected_catboost_mode,
-            iterations=best_iteration,
+            params=selected_catboost_params,
+        )
+        calibrator = globals().get("catboost_probability_calibrator")
+        calibration_metadata = globals().get("catboost_calibration_metadata", {})
+        return ProbabilityCalibratedModel(
+            base_model=base_model,
+            calibrator=calibrator,
+            calibration_method="sigmoid" if calibrator is not None else "none",
+            calibration_metadata=calibration_metadata,
         )
 
     if model_name == "final_gbm":
+        gbm_params = globals().get("selected_gbm_params", GBM_PARAMS)
         return fit_sklearn_main_model(
-            GradientBoostingClassifier(**GBM_PARAMS),
+            GradientBoostingClassifier(**gbm_params),
             X_all,
             y_all,
         )
 
     if model_name == "final_random_forest":
+        random_forest_params = globals().get("selected_random_forest_params", RANDOM_FOREST_PARAMS)
         return fit_sklearn_main_model(
-            RandomForestClassifier(**RANDOM_FOREST_PARAMS),
+            RandomForestClassifier(**random_forest_params),
             X_all,
             y_all,
         )
@@ -1668,40 +2079,40 @@ def build_train_test_diagnostic_row(
     }
 
 
-def _catboost_runtime_params(mode_params: dict, iterations: int | None = None) -> dict:
-    """
-    Убирает служебные поля из конфигурации режима и возвращает параметры CatBoost.
-    """
+def _catboost_runtime_params(params: dict, iterations: int | None = None) -> dict:
     params = {
         key: value
-        for key, value in mode_params.items()
-        if key not in {"description", "complexity_rank"}
+        for key, value in params.items()
+        if key not in {"candidate_id", "params", "complexity_score", "selected", "settings_source"}
     }
     if iterations is not None:
         params["iterations"] = int(iterations)
+    params["allow_writing_files"] = False
     return params
 
 
-def train_catboost_candidate(
-    mode_name: str,
-    mode_params: dict,
+def catboost_complexity_score(params: dict) -> float:
+    return float(params["iterations"] * (2 ** params["depth"]) / max(float(params["l2_leaf_reg"]), 1e-6))
+
+
+def evaluate_catboost_candidate(
+    *,
+    candidate_id: str,
+    params: dict,
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_valid: pd.DataFrame,
     y_valid: pd.Series,
-) -> dict:
+    use_best_model: bool = True,
+) -> tuple[dict, CatBoostClassifier, np.ndarray]:
     """
-    Обучает один режим CatBoost на train_main и оценивает его на validation.
-
-    Возвращает:
-    - обученную dev-модель;
-    - best_iteration;
-    - train/validation метрики;
-    - train-valid gap для контроля переобучения.
+    Обучает один набор параметров CatBoost на train_main и оценивает его на validation.
     """
-    params = _catboost_runtime_params(mode_params)
-    model = CatBoostClassifier(**params)
-    model.fit(X_train, y_train, eval_set=(X_valid, y_valid), use_best_model=True)
+    runtime_params = _catboost_runtime_params(params)
+    started_at = perf_counter()
+    model = CatBoostClassifier(**runtime_params)
+    model.fit(X_train, y_train, eval_set=(X_valid, y_valid), use_best_model=use_best_model)
+    fit_seconds = perf_counter() - started_at
 
     p_train = model.predict_proba(X_train)[:, 1]
     p_valid = model.predict_proba(X_valid)[:, 1]
@@ -1709,15 +2120,28 @@ def train_catboost_candidate(
     train_metrics = metrics_dict(y_train.to_numpy(), p_train)
     valid_metrics = metrics_dict(y_valid.to_numpy(), p_valid)
 
-    best_iteration = int(model.get_best_iteration() or params["iterations"])
+    if use_best_model:
+        best_iteration_index = model.get_best_iteration()
+        best_iteration = (
+            int(best_iteration_index) + 1
+            if best_iteration_index is not None
+            else int(runtime_params["iterations"])
+        )
+    else:
+        best_iteration = int(runtime_params["iterations"])
     gap = float(valid_metrics["logloss"] - train_metrics["logloss"])
 
-    return {
-        "mode_name": mode_name,
-        "model": model,
+    selected_runtime_params = dict(runtime_params)
+    selected_runtime_params["iterations"] = best_iteration
+
+    row = {
+        "candidate_id": candidate_id,
+        "model_name": "final_catboost",
+        "stage": "validation_grid",
+        "params": format_param_dict(selected_runtime_params),
+        "fit_seconds": fit_seconds,
+        "complexity_score": catboost_complexity_score(runtime_params),
         "best_iteration": best_iteration,
-        "complexity_rank": int(mode_params.get("complexity_rank", 999)),
-        "description": mode_params.get("description", ""),
         "train_logloss": float(train_metrics["logloss"]),
         "valid_logloss": float(valid_metrics["logloss"]),
         "train_brier": float(train_metrics["brier"]),
@@ -1727,70 +2151,138 @@ def train_catboost_candidate(
         "train_accuracy": float(train_metrics["accuracy"]),
         "valid_accuracy": float(valid_metrics["accuracy"]),
         "train_valid_logloss_gap": gap,
-        "iterations_requested": int(params["iterations"]),
-        "learning_rate": float(params["learning_rate"]),
-        "depth": int(params["depth"]),
-        "l2_leaf_reg": float(params["l2_leaf_reg"]),
-        "od_wait": int(params.get("od_wait", 0)),
+        "train_n_obs": int(train_metrics["n_obs"]),
+        "valid_n_obs": int(valid_metrics["n_obs"]),
+        "iterations_requested": int(runtime_params["iterations"]),
+        "selected": False,
     }
+    for key, value in selected_runtime_params.items():
+        row[f"param_{key}"] = value
+    return row, model, p_valid
 
 
-def select_best_catboost_mode(candidate_results: list[dict]) -> tuple[str, pd.DataFrame]:
-    """
-    Выбирает режим обучения финальной модели.
+def tune_catboost_model(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_valid: pd.DataFrame,
+    y_valid: pd.Series,
+) -> tuple[dict, pd.DataFrame, CatBoostClassifier, np.ndarray]:
+    candidates = iter_param_grid(CATBOOST_PARAM_GRID)
+    total = len(candidates)
+    rows = []
+    params_by_candidate_id = {}
+    models_by_candidate_id = {}
+    valid_probs_by_candidate_id = {}
 
-    Основная метрика — validation LogLoss.
-    Если несколько режимов отличаются от лучшего результата не более чем
-    на MODEL_SELECTION_VALID_TOLERANCE, выбирается режим с меньшим train-valid gap.
-    Это защищает от выбора чрезмерно тяжелой модели, если ее преимущество
-    на validation статистически/практически несущественно.
-    """
-    table = pd.DataFrame([
-        {key: value for key, value in result.items() if key != "model"}
-        for result in candidate_results
-    ])
-
-    min_valid_logloss = table["valid_logloss"].min()
-    table["within_selection_tolerance"] = (
-        table["valid_logloss"] <= min_valid_logloss + MODEL_SELECTION_VALID_TOLERANCE
-    )
-
-    eligible = table[table["within_selection_tolerance"]].copy()
-
-    selected = (
-        eligible
-        .sort_values(
-            ["train_valid_logloss_gap", "valid_logloss", "complexity_rank"],
-            ascending=[True, True, True],
+    for idx, grid_params in enumerate(candidates, start=1):
+        runtime_params = {**CATBOOST_COMMON_PARAMS, **grid_params}
+        candidate_id = f"catboost_{idx:03d}"
+        print(
+            f"Training CatBoost candidate [{idx}/{total}]: "
+            f"{format_param_dict(grid_params)}"
         )
-        .iloc[0]
+        row, model, p_valid = evaluate_catboost_candidate(
+            candidate_id=candidate_id,
+            params=runtime_params,
+            X_train=X_train,
+            y_train=y_train,
+            X_valid=X_valid,
+            y_valid=y_valid,
+        )
+        rows.append(row)
+        selected_runtime_params = dict(runtime_params)
+        selected_runtime_params["iterations"] = int(row["best_iteration"])
+        params_by_candidate_id[candidate_id] = selected_runtime_params
+        models_by_candidate_id[candidate_id] = model
+        valid_probs_by_candidate_id[candidate_id] = p_valid
+
+    table = sort_tuning_results(pd.DataFrame(rows))
+    selected_candidate_id = str(table.iloc[0]["candidate_id"])
+    table["selected"] = table["candidate_id"] == selected_candidate_id
+    table = table.sort_values(
+        ["selected", "valid_logloss", "valid_brier", "valid_roc_auc", "complexity_score"],
+        ascending=[False, True, True, False, True],
+    ).reset_index(drop=True)
+
+    return (
+        params_by_candidate_id[selected_candidate_id],
+        table,
+        models_by_candidate_id[selected_candidate_id],
+        valid_probs_by_candidate_id[selected_candidate_id],
     )
-
-    selected_mode_name = str(selected["mode_name"])
-
-    table["selected"] = table["mode_name"].eq(selected_mode_name)
-    table = table.sort_values(["selected", "valid_logloss"], ascending=[False, True]).reset_index(drop=True)
-
-    return selected_mode_name, table
 
 
 def fit_final_catboost(
     X_train: pd.DataFrame,
     y_train: pd.Series,
-    selected_mode_name: str,
-    iterations: int,
+    params: dict,
 ) -> CatBoostClassifier:
     """
     Обучает финальную CatBoost-модель на всем train-периоде
-    с выбранным режимом и числом итераций, найденным на validation.
+    с выбранными grid search параметрами.
     """
-    mode_params = CATBOOST_TRAINING_MODES[selected_mode_name]
-    params = _catboost_runtime_params(mode_params, iterations=iterations)
+    params = _catboost_runtime_params(params)
     params["verbose"] = False
 
     model = CatBoostClassifier(**params)
     model.fit(X_train, y_train)
     return model
+
+
+def build_catboost_calibration_table(
+    raw_valid_prob: np.ndarray,
+    y_valid: pd.Series,
+    calibrator,
+) -> pd.DataFrame:
+    y = y_valid.to_numpy()
+    calibrated_valid_prob = apply_sigmoid_calibrator(raw_valid_prob, calibrator)
+    rows = [
+        {
+            "calibration_method": "none",
+            "selected": False,
+            **metrics_dict(y, raw_valid_prob),
+        },
+        {
+            "calibration_method": "sigmoid",
+            "selected": True,
+            **metrics_dict(y, calibrated_valid_prob),
+        },
+    ]
+    table = pd.DataFrame(rows)
+    return table.sort_values(["selected", "logloss"], ascending=[False, True]).reset_index(drop=True)
+
+
+def calibrate_catboost_model(
+    base_model: CatBoostClassifier,
+    raw_valid_prob: np.ndarray,
+    y_valid: pd.Series,
+    *,
+    selected_params: dict,
+    selection_mode: str,
+) -> tuple[ProbabilityCalibratedModel, pd.DataFrame]:
+    """
+    Adds Platt/sigmoid calibration on top of CatBoost probabilities.
+
+    The calibrator is fitted on the internal time-based validation slice.
+    Test data is not used for calibration.
+    """
+    calibrator = fit_sigmoid_calibrator(raw_valid_prob, y_valid.to_numpy())
+    calibration_table = build_catboost_calibration_table(raw_valid_prob, y_valid, calibrator)
+    metadata = {
+        "base_model_type": "CatBoostClassifier",
+        "selected_params": dict(selected_params),
+        "best_iteration": int(selected_params.get("iterations")),
+        "calibration_method": "sigmoid",
+        "calibration_source": "internal_time_based_validation",
+        "model_selection_mode": selection_mode,
+    }
+    calibrated_model = ProbabilityCalibratedModel(
+        base_model=base_model,
+        calibrator=calibrator,
+        calibration_method="sigmoid",
+        calibration_metadata=metadata,
+    )
+    return calibrated_model, calibration_table
 
 
 def build_scored_test_frame(test_df: pd.DataFrame, probability_columns: dict[str, np.ndarray]) -> pd.DataFrame:
@@ -1922,60 +2414,167 @@ p_test_baseline_rating_elo = predict_rating_elo_logreg(
     baseline_rating_elo_features,
 )
 
-# Final model: выбираем один из трех режимов CatBoost по validation.
+# Final CatBoost model: выбираем параметры через time-based grid search.
 X_train_main, X_valid, y_train_main, y_valid = prepare_xy(train_main_df, valid_df, features)
 
-catboost_candidate_results = []
-for mode_name, mode_params in CATBOOST_TRAINING_MODES.items():
-    print(f"Training CatBoost mode: {mode_name}")
-    result = train_catboost_candidate(
-        mode_name=mode_name,
-        mode_params=mode_params,
+saved_catboost_settings = (
+    (SAVED_MODEL_SELECTION_SETTINGS or {}).get("catboost", {})
+    if isinstance(SAVED_MODEL_SELECTION_SETTINGS, dict)
+    else {}
+)
+can_reuse_catboost = (
+    REUSE_MODEL_SELECTION_SETTINGS
+    and bool(saved_catboost_settings.get("params"))
+)
+
+if can_reuse_catboost:
+    selected_catboost_params = {**CATBOOST_COMMON_PARAMS, **normalize_json_params(saved_catboost_settings["params"])}
+    print("Reusing CatBoost params:", format_param_dict(selected_catboost_params))
+
+    catboost_row, catboost_dev_model, p_valid_dev = evaluate_catboost_candidate(
+        candidate_id="catboost_reused_settings",
+        params=selected_catboost_params,
+        X_train=X_train_main,
+        y_train=y_train_main,
+        X_valid=X_valid,
+        y_valid=y_valid,
+        use_best_model=False,
+    )
+    selected_catboost_params["iterations"] = int(catboost_row["best_iteration"])
+    catboost_row["selected"] = True
+    catboost_row["settings_source"] = "saved"
+    catboost_tuning_results = pd.DataFrame([catboost_row])
+else:
+    if REUSE_MODEL_SELECTION_SETTINGS:
+        print("Saved CatBoost grid settings are missing; running CatBoost grid search.")
+    selected_catboost_params, catboost_tuning_results, catboost_dev_model, p_valid_dev = tune_catboost_model(
         X_train=X_train_main,
         y_train=y_train_main,
         X_valid=X_valid,
         y_valid=y_valid,
     )
-    catboost_candidate_results.append(result)
 
-selected_catboost_mode, catboost_mode_results = select_best_catboost_mode(catboost_candidate_results)
-selected_candidate = next(
-    result for result in catboost_candidate_results
-    if result["mode_name"] == selected_catboost_mode
-)
-
-best_iteration = int(selected_candidate["best_iteration"])
+best_iteration = int(selected_catboost_params["iterations"])
 
 X_train_full, X_test, y_train_full, y_test = prepare_xy(train_df, test_df, features)
-final_model = fit_final_catboost(
+final_catboost_base_model = fit_final_catboost(
     X_train=X_train_full,
     y_train=y_train_full,
-    selected_mode_name=selected_catboost_mode,
-    iterations=best_iteration,
+    params=selected_catboost_params,
 )
+
+final_model, catboost_calibration_results = calibrate_catboost_model(
+    base_model=final_catboost_base_model,
+    raw_valid_prob=p_valid_dev,
+    y_valid=y_valid,
+    selected_params=selected_catboost_params,
+    selection_mode=MODEL_SELECTION_MODE,
+)
+catboost_probability_calibrator = final_model.calibrator
+catboost_calibration_metadata = final_model.calibration_metadata
 
 p_test_final_catboost = final_model.predict_proba(X_test)[:, 1]
 
 # Additional main model 1: Gradient Boosting Machine (sklearn GBM).
+# Параметры выбираются на внутренней time-based validation-части train-периода.
+saved_gbm_params = (
+    (SAVED_MODEL_SELECTION_SETTINGS or {}).get("gbm", {}).get("params")
+    if isinstance(SAVED_MODEL_SELECTION_SETTINGS, dict)
+    else None
+)
+if REUSE_MODEL_SELECTION_SETTINGS and saved_gbm_params:
+    selected_gbm_params = normalize_json_params(saved_gbm_params)
+    print("Reusing GBM params:", format_param_dict(selected_gbm_params))
+    gbm_row, _ = evaluate_sklearn_candidate(
+        candidate_id="gbm_reused_settings",
+        model_name="final_gbm",
+        stage="reused_saved_settings",
+        estimator=GradientBoostingClassifier(**selected_gbm_params),
+        params=selected_gbm_params,
+        X_train=X_train_main,
+        y_train=y_train_main,
+        X_valid=X_valid,
+        y_valid=y_valid,
+        complexity_score=gbm_complexity_score(selected_gbm_params),
+    )
+    gbm_row["selected"] = True
+    gbm_row["settings_source"] = "saved"
+    gbm_tuning_results = pd.DataFrame([gbm_row])
+else:
+    if REUSE_MODEL_SELECTION_SETTINGS:
+        print("Saved GBM settings are missing; running GBM grid search.")
+    selected_gbm_params, gbm_tuning_results = tune_gbm_model(
+        X_train=X_train_main,
+        y_train=y_train_main,
+        X_valid=X_valid,
+        y_valid=y_valid,
+    )
 final_gbm_model = fit_sklearn_main_model(
-    GradientBoostingClassifier(**GBM_PARAMS),
+    GradientBoostingClassifier(**selected_gbm_params),
     X_train_full,
     y_train_full,
 )
 p_test_final_gbm = predict_sklearn_main_model(final_gbm_model, X_test)
 
 # Additional main model 2: Random Forest.
+# Параметры выбираются на той же validation-части; final test не участвует в подборе.
+saved_random_forest_params = (
+    (SAVED_MODEL_SELECTION_SETTINGS or {}).get("random_forest", {}).get("params")
+    if isinstance(SAVED_MODEL_SELECTION_SETTINGS, dict)
+    else None
+)
+if REUSE_MODEL_SELECTION_SETTINGS and saved_random_forest_params:
+    selected_random_forest_params = normalize_json_params(saved_random_forest_params)
+    if "n_jobs" in selected_random_forest_params:
+        selected_random_forest_params["n_jobs"] = SKLEARN_SEARCH_N_JOBS
+    print("Reusing Random Forest params:", format_param_dict(selected_random_forest_params))
+    random_forest_row, _ = evaluate_sklearn_candidate(
+        candidate_id="rf_reused_settings",
+        model_name="final_random_forest",
+        stage="reused_saved_settings",
+        estimator=RandomForestClassifier(**selected_random_forest_params),
+        params=selected_random_forest_params,
+        X_train=X_train_main,
+        y_train=y_train_main,
+        X_valid=X_valid,
+        y_valid=y_valid,
+        complexity_score=random_forest_complexity_score(selected_random_forest_params),
+    )
+    random_forest_row["selected"] = True
+    random_forest_row["settings_source"] = "saved"
+    random_forest_tuning_results = pd.DataFrame([random_forest_row])
+else:
+    if REUSE_MODEL_SELECTION_SETTINGS:
+        print("Saved Random Forest settings are missing; running Random Forest grid search.")
+    selected_random_forest_params, random_forest_tuning_results = tune_random_forest_model(
+        X_train=X_train_main,
+        y_train=y_train_main,
+        X_valid=X_valid,
+        y_valid=y_valid,
+    )
 final_random_forest_model = fit_sklearn_main_model(
-    RandomForestClassifier(**RANDOM_FOREST_PARAMS),
+    RandomForestClassifier(**selected_random_forest_params),
     X_train_full,
     y_train_full,
 )
 p_test_final_random_forest = predict_sklearn_main_model(final_random_forest_model, X_test)
 
+# Linear probability benchmark on the same full feature set.
+linear_regression_full_model = fit_linear_regression_model(X_train_full, y_train_full)
+p_train_linear_regression_full = predict_linear_regression_model(linear_regression_full_model, X_train_full)
+p_test_linear_regression_full = predict_linear_regression_model(linear_regression_full_model, X_test)
+
 main_model_diagnostics = pd.DataFrame([
     build_train_test_diagnostic_row("final_catboost", final_model, X_train_full, y_train_full, X_test, y_test),
     build_train_test_diagnostic_row("final_gbm", final_gbm_model, X_train_full, y_train_full, X_test, y_test),
     build_train_test_diagnostic_row("final_random_forest", final_random_forest_model, X_train_full, y_train_full, X_test, y_test),
+    build_train_test_probability_diagnostic_row(
+        "linear_regression_full",
+        y_train_full,
+        p_train_linear_regression_full,
+        y_test,
+        p_test_linear_regression_full,
+    ),
 ])
 
 scored_test = build_scored_test_frame(test_df, {
@@ -1984,6 +2583,7 @@ scored_test = build_scored_test_frame(test_df, {
     "adjusted_rating_only": p_test_adjusted_rating_only,
     "elo_only": p_test_elo_only,
     "baseline_rating_elo": p_test_baseline_rating_elo,
+    "linear_regression_full": p_test_linear_regression_full,
     "final_catboost": p_test_final_catboost,
     "final_gbm": p_test_final_gbm,
     "final_random_forest": p_test_final_random_forest,
@@ -1995,6 +2595,7 @@ MODEL_DISPLAY_ORDER = [
     "adjusted_rating_only",
     "elo_only",
     "baseline_rating_elo",
+    "linear_regression_full",
     "final_catboost",
     "final_gbm",
     "final_random_forest",
@@ -2018,15 +2619,20 @@ MODEL_DESCRIPTIONS = {
     ),
     "elo_only": "Чистый benchmark: вероятность только из ELO.",
     "baseline_rating_elo": "Простая Logistic Regression на рейтинге и ELO.",
+    "linear_regression_full": (
+        "Linear Regression benchmark on the full feature set; predictions are interpreted as probabilities and clipped to [0, 1]."
+    ),
     "final_catboost": (
         "Финальная CatBoost-модель со всеми признаками, включая общих соперников. "
-        f"Режим обучения: {selected_catboost_mode}."
+        "Параметры выбраны time-based grid search внутри train; вероятности откалиброваны методом sigmoid/Platt."
     ),
     "final_gbm": (
-        "Основная GBM-модель sklearn GradientBoostingClassifier на том же полном наборе признаков."
+        "Основная GBM-модель sklearn GradientBoostingClassifier на полном наборе признаков; "
+        "параметры выбраны time-based validation search внутри train."
     ),
     "final_random_forest": (
-        "Основная Random Forest-модель на том же полном наборе признаков."
+        "Основная Random Forest-модель на полном наборе признаков; "
+        "параметры выбраны time-based validation search внутри train."
     ),
 }
 
@@ -2099,14 +2705,25 @@ print("Best main model description:", best_main_model_description)
 print("Train rows:", train_df.shape[0], "| Test rows:", test_df.shape[0])
 print("Train dates:", train_df["match_date"].min(), "->", train_df["match_date"].max())
 print("Test dates:", test_df["match_date"].min(), "->", test_df["match_date"].max())
-print("Selected CatBoost mode:", selected_catboost_mode)
-print("Selected CatBoost best_iteration:", best_iteration)
+print("Selected CatBoost params:", format_param_dict(selected_catboost_params))
+print("CatBoost probability calibration:", catboost_calibration_metadata.get("calibration_method", "none"))
+print("Selected GBM params:", format_param_dict(selected_gbm_params))
+print("Selected Random Forest params:", format_param_dict(selected_random_forest_params))
 print("Best rating-only scale:", best_rating_scale)
 print("Best relative-rating-only scale:", best_relative_rating_scale)
 print("Best adjusted-rating-only scale:", best_adjusted_rating_scale)
 
-display(Markdown("### Результаты выбора режима CatBoost"))
-display(catboost_mode_results)
+display(Markdown("### Результаты подбора параметров CatBoost"))
+display(sort_tuning_results(catboost_tuning_results).head(12))
+
+display(Markdown("### Калибровка вероятностей CatBoost"))
+display(catboost_calibration_results)
+
+display(Markdown("### Результаты подбора параметров GBM"))
+display(sort_tuning_results(gbm_tuning_results).head(10))
+
+display(Markdown("### Результаты подбора параметров Random Forest"))
+display(random_forest_tuning_results.head(12))
 
 display(Markdown("### Итоговая архитектура"))
 display(pd.DataFrame([
@@ -2521,7 +3138,7 @@ def build_feature_importance_tables(
 
 
 feature_importance_pvc, feature_importance_shap = build_feature_importance_tables(
-    model=final_model,
+    model=unwrap_base_model(final_model),
     X_test=X_test,
     y_test=y_test,
 )
@@ -2945,8 +3562,9 @@ def explain_main_model_prediction(model, model_name: str, X_pred: pd.DataFrame, 
     в двух prediction-строках. Это не локальный SHAP, но дает понятное объяснение,
     какие признаки в выбранной модели в целом наиболее важны.
     """
-    if isinstance(model, CatBoostClassifier):
-        result = shap_explain_prediction(model, X_pred, top_n=top_n)
+    base_model = unwrap_base_model(model)
+    if isinstance(base_model, CatBoostClassifier):
+        result = shap_explain_prediction(base_model, X_pred, top_n=top_n)
         result["model_name"] = model_name
         result["explanation_type"] = "local_catboost_shap"
         return result
@@ -3293,10 +3911,14 @@ feature_importance_path = FEATURES_DIR / "feature_importance.csv"
 dataset_overview_path = DIAGNOSTICS_DIR / "dataset_overview.csv"
 
 # 05_model_selection
-catboost_mode_results_path = MODEL_SELECTION_DIR / "catboost_training_mode_selection.csv"
+catboost_tuning_results_path = MODEL_SELECTION_DIR / "catboost_hyperparameter_search.csv"
+catboost_calibration_results_path = MODEL_SELECTION_DIR / "catboost_probability_calibration.csv"
+gbm_tuning_results_path = MODEL_SELECTION_DIR / "gbm_hyperparameter_search.csv"
+random_forest_tuning_results_path = MODEL_SELECTION_DIR / "random_forest_hyperparameter_search.csv"
 main_model_diagnostics_path = MODEL_SELECTION_DIR / "main_model_train_test_diagnostics.csv"
 best_main_model_selection_path = MODEL_SELECTION_DIR / "best_main_model_selection.csv"
 sklearn_feature_importance_path = FEATURES_DIR / "sklearn_tree_feature_importance.csv"
+run_model_selection_settings_path = RUN_DIR / "model_selection_settings.json"
 prediction_bundle_path = DATA_PATH.parent / "prediction_bundle.joblib"
 run_prediction_bundle_path = RUN_DIR / "prediction_bundle.joblib"
 
@@ -3309,12 +3931,41 @@ feature_catalog_table.to_csv(feature_catalog_path, index=False)
 feature_importance_combined.to_csv(feature_importance_path, index=False)
 
 overview_df.to_csv(dataset_overview_path, index=False)
-catboost_mode_results.to_csv(catboost_mode_results_path, index=False)
+catboost_tuning_results.to_csv(catboost_tuning_results_path, index=False)
+catboost_calibration_results.to_csv(catboost_calibration_results_path, index=False)
+gbm_tuning_results.to_csv(gbm_tuning_results_path, index=False)
+random_forest_tuning_results.to_csv(random_forest_tuning_results_path, index=False)
 main_model_diagnostics.to_csv(main_model_diagnostics_path, index=False)
 best_main_model_selection_table.to_csv(best_main_model_selection_path, index=False)
 
 if "sklearn_feature_importance_table" in globals() and isinstance(sklearn_feature_importance_table, pd.DataFrame):
     sklearn_feature_importance_table.to_csv(sklearn_feature_importance_path, index=False)
+
+model_selection_settings = {
+    "schema_version": 1,
+    "created_at": pd.Timestamp.now().isoformat(),
+    "run_dir": str(RUN_DIR),
+    "model_selection_mode": MODEL_SELECTION_MODE,
+    "test_lookback_months": TEST_LOOKBACK_MONTHS,
+    "dev_valid_fraction": DEV_VALID_FRACTION,
+    "catboost": {
+        "params": json_safe(selected_catboost_params),
+        "calibration_method": catboost_calibration_metadata.get("calibration_method", "sigmoid"),
+        "calibration_source": catboost_calibration_metadata.get("calibration_source", "internal_time_based_validation"),
+    },
+    "gbm": {
+        "params": json_safe(selected_gbm_params),
+    },
+    "random_forest": {
+        "params": json_safe(selected_random_forest_params),
+    },
+    "best_main_model_name": best_main_model_name,
+}
+
+for settings_path in [MODEL_SELECTION_SETTINGS_PATH, run_model_selection_settings_path]:
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    with settings_path.open("w", encoding="utf-8") as file:
+        json.dump(model_selection_settings, file, ensure_ascii=False, indent=2)
 
 prediction_bundle = {
     "created_at": pd.Timestamp.now().isoformat(),
@@ -3329,6 +3980,14 @@ prediction_bundle = {
     "rating_history": rating_history_for_bundle.copy(),
     "feature_catalog": feature_catalog_table.copy(),
     "feature_importance": feature_importance_combined.copy(),
+    "selected_catboost_params": selected_catboost_params,
+    "selected_gbm_params": selected_gbm_params,
+    "selected_random_forest_params": selected_random_forest_params,
+    "model_selection_settings": model_selection_settings,
+    "catboost_calibration": catboost_calibration_results.copy(),
+    "catboost_tuning_results": catboost_tuning_results.copy(),
+    "gbm_tuning_results": gbm_tuning_results.copy(),
+    "random_forest_tuning_results": random_forest_tuning_results.copy(),
     "sklearn_feature_importance": (
         sklearn_feature_importance_table.copy()
         if "sklearn_feature_importance_table" in globals() and isinstance(sklearn_feature_importance_table, pd.DataFrame)
@@ -3360,9 +4019,14 @@ saved_files = [
     feature_catalog_path,
     feature_importance_path,
     dataset_overview_path,
-    catboost_mode_results_path,
+    catboost_tuning_results_path,
+    catboost_calibration_results_path,
+    gbm_tuning_results_path,
+    random_forest_tuning_results_path,
     main_model_diagnostics_path,
     best_main_model_selection_path,
+    MODEL_SELECTION_SETTINGS_PATH,
+    run_model_selection_settings_path,
 ]
 
 if rating_scale_grid_path.exists():

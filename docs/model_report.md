@@ -7,7 +7,7 @@
 Отчет соответствует последнему сохраненному прогону обучения:
 
 ```text
-assembled_predictor/model_results/run_20260512_141002
+assembled_predictor/model_results/run_20260514_163444
 ```
 
 ## Данные
@@ -25,11 +25,13 @@ assembled_predictor/model_results/run_20260512_141002
 | Период матчей | 2025-03-02 - 2026-05-11 |
 | Матчей в train | 6326 |
 | Матчей в test | 1233 |
-| Уникальных игроков | 2049 |
+| Уникальных игроков | 1315 |
 | Уникальных турниров | 149 |
 | Доля побед player1 | 51.0% |
-| Строк с adjusted rating diff | 13260 |
-| Строк с relative rating diff | 13260 |
+| Строк с adjusted rating diff | 14774 |
+| Строк с relative rating diff | 14774 |
+| Покрытие РНИ player1 / player2 | 100.0% / 100.0% |
+| Покрытие рейтингов player1 / player2 | 98.7% / 99.0% |
 | Используемых признаков финальной модели | 43 |
 
 ## Разделение Train/Test
@@ -43,7 +45,7 @@ assembled_predictor/model_results/run_20260512_141002
 | Train | 6326 |
 | Test | 1233 |
 
-Внутри train дополнительно используется validation-часть для выбора режима CatBoost и диагностики настроек.
+Внутри train дополнительно используется validation-часть для подбора параметров CatBoost, GBM и Random Forest, а также для калибровки вероятностей CatBoost.
 
 ## Признаки
 
@@ -64,20 +66,21 @@ assembled_predictor/model_results/run_20260512_141002
 
 ## Сравнение Моделей
 
-Для сравнения использовалась match-level оценка с симметризацией вероятности пары игроков. Основной критерий - LogLoss на test-выборке: чем он ниже, тем лучше калибрована вероятностная оценка. Дополнительно анализируются Brier score, ROC-AUC и Accuracy.
+Для сравнения использовалась match-level оценка с симметризацией вероятности пары игроков. Основной критерий - LogLoss на test-выборке: чем он ниже, тем лучше калибрована вероятностная оценка. Дополнительно анализируются Brier score, ROC-AUC и Accuracy. Параметры CatBoost, GBM и Random Forest подбираются на внутренней time-based validation-части train-периода, без перемешивания временных данных и без использования final test. Для CatBoost поверх базовой модели применяется sigmoid/Platt-калибровка вероятностей, обученная на внутренней validation-части train.
 
 | Модель | N | LogLoss | Brier | ROC-AUC | Accuracy |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Gradient Boosting | 1233 | 0.4557 | 0.1498 | 0.8658 | 0.7810 |
-| CatBoost | 1233 | 0.4561 | 0.1501 | 0.8653 | 0.7826 |
-| Random Forest | 1233 | 0.4621 | 0.1518 | 0.8621 | 0.7721 |
-| Rating + ELO baseline | 1233 | 0.4942 | 0.1635 | 0.8403 | 0.7575 |
-| Adjusted rating only | 1109 | 0.5666 | 0.1813 | 0.8161 | 0.7583 |
-| Relative rating only | 1109 | 0.5680 | 0.1760 | 0.8274 | 0.7493 |
-| ELO only | 1233 | 0.6003 | 0.2065 | 0.7475 | 0.6918 |
-| Rating only | 1109 | 0.6691 | 0.1823 | 0.8080 | 0.7493 |
+| CatBoost | 1233 | 0.4377 | 0.1433 | 0.8766 | 0.7875 |
+| Gradient Boosting | 1233 | 0.4387 | 0.1436 | 0.8772 | 0.7867 |
+| Random Forest | 1233 | 0.4413 | 0.1441 | 0.8754 | 0.7794 |
+| Rating + ELO baseline | 1233 | 0.4810 | 0.1579 | 0.8513 | 0.7616 |
+| Linear Regression full features | 1233 | 0.5050 | 0.1499 | 0.8663 | 0.7737 |
+| Adjusted rating only | 1214 | 0.5647 | 0.1797 | 0.8199 | 0.7611 |
+| Relative rating only | 1214 | 0.5717 | 0.1751 | 0.8299 | 0.7537 |
+| ELO only | 1233 | 0.5955 | 0.2045 | 0.7520 | 0.6894 |
+| Rating only | 1214 | 0.6628 | 0.1791 | 0.8127 | 0.7537 |
 
-Лучший результат по основному критерию показал `GradientBoostingClassifier`. Он выбран как production-модель последнего прогона и сохранен в prediction bundle как `production_gbm`.
+Лучший результат по основному критерию показал `CatBoostClassifier`. Он выбран как production-модель последнего прогона и сохранен в prediction bundle как `production_catboost`. Linear Regression используется как дополнительный линейный бенчмарк на полном наборе признаков и не входит в набор production-кандидатов.
 
 ## Диагностика Основных Моделей
 
@@ -85,54 +88,82 @@ Train/test диагностика показывает не только кач�
 
 | Модель | Train LogLoss | Test LogLoss | Gap | Train ROC-AUC | Test ROC-AUC | Train Brier | Test Brier |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| CatBoost | 0.4229 | 0.4599 | 0.0370 | 0.8897 | 0.8632 | 0.1368 | 0.1513 |
-| Gradient Boosting | 0.4408 | 0.4598 | 0.0190 | 0.8767 | 0.8636 | 0.1438 | 0.1513 |
-| Random Forest | 0.3236 | 0.4637 | 0.1401 | 0.9626 | 0.8608 | 0.0954 | 0.1524 |
+| CatBoost | 0.4271 | 0.4403 | 0.0132 | 0.8880 | 0.8751 | 0.1376 | 0.1442 |
+| Gradient Boosting | 0.4400 | 0.4409 | 0.0009 | 0.8777 | 0.8760 | 0.1428 | 0.1444 |
+| Random Forest | 0.4012 | 0.4422 | 0.0410 | 0.9064 | 0.8748 | 0.1280 | 0.1445 |
+| Linear Regression full features | 0.5090 | 0.5092 | 0.0002 | 0.8494 | 0.8655 | 0.1615 | 0.1504 |
 
-Random Forest заметно сильнее подгоняется под train, что видно по большому train/test LogLoss gap. Gradient Boosting дает лучший test LogLoss среди основных моделей и при этом имеет меньший разрыв между train и test.
+Random Forest после подбора параметров стал заметно менее переобученным, чем в фиксированной конфигурации, но его train/test gap все еще выше, чем у CatBoost и Gradient Boosting. Gradient Boosting остается очень близким конкурентом: его ROC-AUC немного выше, но CatBoost дает лучший test LogLoss среди production-кандидатов. Linear Regression имеет минимальный train/test gap, но существенно уступает по LogLoss, поэтому рассматривается только как диагностический бенчмарк.
 
-## Режимы CatBoost
+## Подбор Параметров CatBoost
 
-Для CatBoost сравниваются три режима: `light`, `balanced` и `power`. Они отличаются количеством итераций, learning rate, глубиной и регуляризацией. В последнем прогоне выбран режим `light`.
+Для CatBoost используется тот же принцип, что и для остальных основных моделей: time-based validation search внутри train-периода. В тяжелом режиме пайплайна перебираются комбинации `iterations`, `learning_rate`, `depth`, `l2_leaf_reg` и `od_wait`; final test остается полностью отложенным.
 
-| Режим | Selected | Valid LogLoss | Valid Brier | Valid ROC-AUC | Train/Valid Gap | Complexity Rank | Best Iteration |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| light | True | 0.4606 | 0.1503 | 0.8644 | 0.0416 | 1 | 611 |
-| balanced | False | 0.4592 | 0.1496 | 0.8655 | 0.0480 | 2 | 1269 |
-| power | False | 0.4606 | 0.1506 | 0.8641 | 0.0605 | 3 | 1702 |
+В последнем прогоне с перекалибровкой выбраны следующие параметры CatBoost:
 
-Хотя `balanced` имеет чуть более низкий validation LogLoss, режим `light` выбран как более компактный и менее склонный к переобучению в рамках установленного tolerance.
+| Параметр | Значение |
+| --- | ---: |
+| iterations | 403 |
+| learning_rate | 0.045 |
+| depth | 5 |
+| l2_leaf_reg | 8.0 |
+| od_wait | 200 |
+
+Полная таблица перебора в тяжелом режиме сохраняется в `catboost_hyperparameter_search.csv`.
+
+## Калибровка Вероятностей CatBoost
+
+После выбора параметров CatBoost поверх базовой модели обучается sigmoid/Platt-калибратор. Он получает на вход raw-вероятность CatBoost, переведенную в logit, и корректирует итоговую вероятность победы. Калибратор обучается только на внутренней validation-части train-периода; final test не используется.
+
+| Метод | Selected | Valid LogLoss | Valid Brier | Valid ROC-AUC | Accuracy |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| sigmoid/Platt | True | 0.4390 | 0.1426 | 0.8770 | 0.7783 |
+| none | False | 0.4397 | 0.1428 | 0.8770 | 0.7777 |
+
+## Подбор Параметров GBM И Random Forest
+
+Для GBM и Random Forest используется не классический `GridSearchCV` с перемешиванием, а time-based validation search. Train-период дополнительно делится по времени: более ранняя часть используется для обучения кандидатов, более поздняя часть - для выбора параметров. Final test остается полностью отложенным и применяется только для итогового сравнения выбранных моделей.
+
+В последнем прогоне выбраны следующие параметры:
+
+| Модель | Выбранные параметры | Validation LogLoss |
+| --- | --- | ---: |
+| Gradient Boosting | `n_estimators=250`, `learning_rate=0.04`, `max_depth=3`, `min_samples_leaf=15`, `subsample=0.85` | 0.4454 |
+| Random Forest | `n_estimators=1000`, `max_depth=12`, `min_samples_leaf=15`, `max_features=sqrt`, `class_weight=balanced_subsample` | 0.4543 |
+
+Для GBM сетка проверяется через staged-prediction: модель обучается на максимальном числе деревьев для каждой комбинации остальных параметров, а промежуточные значения `n_estimators` оцениваются без повторного полного обучения. Для Random Forest сначала сравниваются кандидаты на 500 деревьях, затем несколько лучших конфигураций дообучаются на 1000 деревьях. Полные таблицы перебора сохраняются в `gbm_hyperparameter_search.csv` и `random_forest_hyperparameter_search.csv` внутри папки последнего прогона модели.
 
 ## Production-Модель
 
 Алгоритм выбора production-модели детерминированный:
 
 1. Сравниваются основные модели на test-выборке в match-level symmetrized представлении.
-2. Модели сортируются по test LogLoss по возрастанию.
-3. При близком LogLoss вторым критерием выступает test Brier score по возрастанию.
-4. Третьим критерием является test ROC-AUC по убыванию.
-5. Accuracy и train/test LogLoss gap используются как обязательная диагностика, но не являются первичными ключами сортировки.
+2. В production-кандидаты входят CatBoost, Gradient Boosting и Random Forest; простые рейтинговые модели и Linear Regression остаются бенчмарками.
+3. Модели сортируются по test LogLoss по возрастанию.
+4. При близком LogLoss вторым критерием выступает test Brier score по возрастанию.
+5. Третьим критерием является test ROC-AUC по убыванию.
+6. Accuracy и train/test LogLoss gap используются как обязательная диагностика, но не являются первичными ключами сортировки.
 
 После выбора типа модели production-версия обучается заново на всей доступной истории матчей, чтобы пользовательский прогноз учитывал максимально свежие данные. Test-метрики при этом сохраняются отдельно и считаются только по holdout-периоду.
 
 ## Важность Признаков
 
-Ниже приведены наиболее важные признаки для production-кандидата Gradient Boosting по встроенной важности дерева.
+Ниже приведены наиболее важные признаки для выбранной CatBoost-модели по среднему абсолютному SHAP-вкладу.
 
 | Признак | Важность |
 | --- | ---: |
-| rel_diff_points_per_counting_tournament_pct_min_pre_observed_only | 0.5411 |
-| expected_win_prob_elo | 0.0924 |
-| rel_diff_points_pct_min_pre_observed_only | 0.0899 |
-| elo_diff | 0.0828 |
-| diff_points_per_counting_tournament_pre_observed_only | 0.0238 |
-| diff_rank_pre_observed_only | 0.0155 |
-| opp_elo_last_5 | 0.0150 |
-| days_since_prev_match | 0.0148 |
-| player_winrate_all | 0.0123 |
-| schedule_strength | 0.0121 |
-| elo_pre | 0.0115 |
-| experience_diff | 0.0110 |
+| rel_diff_points_per_counting_tournament_pct_min_pre_observed_only | 0.5230 |
+| elo_diff | 0.4616 |
+| expected_win_prob_elo | 0.4580 |
+| diff_points_per_counting_tournament_pre_observed_only | 0.2608 |
+| diff_rank_pre_observed_only | 0.2237 |
+| rel_diff_points_pct_min_pre_observed_only | 0.1726 |
+| experience_diff | 0.0964 |
+| opponent_points_pre | 0.0950 |
+| rest_diff_days | 0.0897 |
+| opp_elo_last_5 | 0.0854 |
+| player_winrate_all | 0.0809 |
+| elo_pre | 0.0757 |
 
 Главный вклад дают рейтинговые и ELO-признаки. Дополнительные факторы - сила недавних соперников, отдых, опыт и общие соперники - помогают уточнять прогноз в пограничных матчах и улучшают калибровку вероятности.
 

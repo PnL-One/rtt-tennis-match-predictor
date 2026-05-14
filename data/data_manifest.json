@@ -1,11 +1,11 @@
 {
-  "generated_at": "2026-05-12T07:11:48.687155+00:00",
+  "generated_at": "2026-05-14T13:47:22.343300+00:00",
   "tournaments": {
     "file": {
       "exists": true,
       "path": "data\\tournaments_master.xlsx",
-      "size_bytes": 56295,
-      "modified_at": "2026-05-12T06:51:36.292419+00:00"
+      "size_bytes": 56297,
+      "modified_at": "2026-05-14T11:23:54.333710+00:00"
     },
     "rows": 473,
     "unique_tour_ids": 473,
@@ -23,7 +23,7 @@
       "exists": true,
       "path": "rtt_rankings_saved\\rtt_rankings_all_dates.csv",
       "size_bytes": 88613123,
-      "modified_at": "2026-05-12T06:53:21.149570+00:00"
+      "modified_at": "2026-05-14T11:25:40.532181+00:00"
     },
     "rows": 218045,
     "unique_rni": 8610,
@@ -35,8 +35,8 @@
     "file": {
       "exists": true,
       "path": "assembled_predictor\\predictor_model_dataset_from_parsers.xlsx",
-      "size_bytes": 22516925,
-      "modified_at": "2026-05-12T07:07:43.883752+00:00"
+      "size_bytes": 23336479,
+      "modified_at": "2026-05-14T11:30:02.072651+00:00"
     },
     "sheets": [
       "ml_dataset",
@@ -63,10 +63,10 @@
       "unmatched_players": 18.0,
       "rating_history_rows": 218045.0,
       "rating_history_unique_rni": 8610.0,
-      "player1_rni_match_rate": 0.9444370948538167,
-      "player2_rni_match_rate": 0.9495965074745336,
-      "player1_rating_coverage": 0.9432464611721127,
-      "player2_rating_coverage": 0.9490673369493319
+      "player1_rni_match_rate": 1.0,
+      "player2_rni_match_rate": 1.0,
+      "player1_rating_coverage": 0.987299907395158,
+      "player2_rating_coverage": 0.9899457600211669
     },
     "ml_rows": 15118,
     "max_match_date": "2026-05-11",

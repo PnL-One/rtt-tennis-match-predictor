@@ -1394,6 +1394,9 @@ def build_rni_mapping(rankings_df: pd.DataFrame) -> pd.DataFrame:
         df["rni_from_href"],
     )
 
+    if "ranking_date" in df.columns:
+        df["_ranking_date_dt_for_mapping"] = df["ranking_date"].apply(parse_ru_date)
+
     agg_dict = {
         "rni": lambda x: sorted(set([normalize_text(v) for v in x if normalize_text(v)])),
         "rni_from_href": lambda x: sorted(set([normalize_text(v) for v in x if normalize_text(v)])),
@@ -1404,8 +1407,8 @@ def build_rni_mapping(rankings_df: pd.DataFrame) -> pd.DataFrame:
         if optional_col in df.columns:
             agg_dict[optional_col] = lambda x: sorted(set([normalize_text(v) for v in x if normalize_text(v)]))
 
-    if "ranking_date" in df.columns:
-        agg_dict["ranking_date"] = ["min", "max", "nunique"]
+    if "_ranking_date_dt_for_mapping" in df.columns:
+        agg_dict["_ranking_date_dt_for_mapping"] = ["min", "max", "nunique"]
 
     mapping = df.groupby(["rni_best", "fio_best"], dropna=False).agg(agg_dict)
 
@@ -1416,6 +1419,19 @@ def build_rni_mapping(rankings_df: pd.DataFrame) -> pd.DataFrame:
         for col in mapping.columns
     ]
     mapping = mapping.reset_index()
+
+    mapping = mapping.rename(columns={
+        "_ranking_date_dt_for_mapping_min": "ranking_date_min",
+        "_ranking_date_dt_for_mapping_max": "ranking_date_max",
+        "_ranking_date_dt_for_mapping_nunique": "ranking_date_nunique",
+        "ranking_date_dt_for_mapping_min": "ranking_date_min",
+        "ranking_date_dt_for_mapping_max": "ranking_date_max",
+        "ranking_date_dt_for_mapping_nunique": "ranking_date_nunique",
+    })
+
+    for col in ["ranking_date_min", "ranking_date_max"]:
+        if col in mapping.columns:
+            mapping[col] = pd.to_datetime(mapping[col], errors="coerce").dt.strftime("%d.%m.%Y")
 
     for col in mapping.columns:
         if mapping[col].apply(lambda v: isinstance(v, list)).any():

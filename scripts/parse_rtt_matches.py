@@ -340,6 +340,21 @@ async def save_rendered_pages_from_excel(input_excel_path: str) -> pd.DataFrame:
 
     save_log_rows: List[Dict[str, Any]] = []
 
+    if rows_to_process.empty:
+        save_log_df = skipped_df.copy()
+        save_log_df.to_excel(SAVE_LOG_PATH, index=False)
+
+        if TOURNAMENTS_MASTER_PATH.exists() and "tour_id" in df.columns and "matches_page_saved" in df.columns:
+            ok_tour_ids = set(save_log_df.loc[save_log_df["save_status"].eq("ok"), "tour_id"].dropna().astype(str))
+            if ok_tour_ids:
+                updated_master = df.copy()
+                updated_master["tour_id"] = updated_master["tour_id"].astype(str)
+                updated_master.loc[updated_master["tour_id"].isin(ok_tour_ids), "matches_page_saved"] = True
+                updated_master.to_excel(TOURNAMENTS_MASTER_PATH, index=False)
+                print(f"Updated matches_page_saved for {len(ok_tour_ids)} tournaments in {TOURNAMENTS_MASTER_PATH}")
+
+        return save_log_df
+
     async with async_playwright() as playwright:
         browser = await playwright.firefox.launch(headless=HEADLESS)
         context = await browser.new_context(
@@ -477,11 +492,43 @@ def looks_like_score(text: str) -> bool:
     patterns = [
         r"^\d+:\d+$",
         r"^\d+-\d+$",
+        r"^\d+\s*[-–—:]\s*\d+$",
         r"^\d+:\d+\s+\d+:\d+$",
         r"^\d+-\d+\s+\d+-\d+$",
+        r"^\d+\s*[-–—:]\s*\d+\s+[\d\[\],:;\-\s\(\)]+$",
         r"^(\d+:\d+|\d+-\d+)(\s+(\d+:\d+|\d+-\d+)){1,4}$",
     ]
     return any(re.match(pattern, text) for pattern in patterns)
+
+def normalize_column_name(value: Any) -> str:
+    text = normalize_space(value).lower().replace("ё", "е")
+    text = re.sub(r"[^a-zа-я0-9]+", "", text)
+    return text
+
+def first_matching_column(columns: list[str], candidates: set[str]) -> str | None:
+    for col in columns:
+        if normalize_column_name(col) in candidates:
+            return col
+    return None
+
+def has_match_table_columns(table: pd.DataFrame) -> bool:
+    columns = list(table.columns.astype(str))
+    player1_col = first_matching_column(columns, {"участник1", "игрок1", "player1"})
+    player2_col = first_matching_column(columns, {"участник2", "игрок2", "player2"})
+    score_col = first_matching_column(columns, {"счет", "score", "результат"})
+    return bool(player1_col and player2_col and score_col)
+
+def is_missing_match_value(value: Any) -> bool:
+    text = normalize_space(value).lower().replace("ё", "е")
+    return text in {"", "nan", "none", "nat", "отсутствуют данные", "нет данных"}
+
+def normalize_score_text(value: Any) -> str:
+    text = normalize_space(value)
+    if is_missing_match_value(text):
+        return ""
+    text = re.sub(r"\s*[-–—]\s*", " - ", text, count=1)
+    text = re.sub(r"\s*,\s*", ",", text)
+    return normalize_space(text)
 
 def is_player_like(text: str) -> bool:
     text = normalize_space(text)
@@ -544,6 +591,41 @@ def table_to_match_rows(
     if table.empty:
         return rows
 
+    columns = list(table.columns.astype(str))
+    player1_col = first_matching_column(columns, {"участник1", "игрок1", "player1"})
+    player2_col = first_matching_column(columns, {"участник2", "игрок2", "player2"})
+    score_col = first_matching_column(columns, {"счет", "score", "результат"})
+    round_col = first_matching_column(columns, {"этаптурнира", "этап", "стадия", "round"})
+
+    if player1_col and player2_col:
+        for row_idx in range(len(table)):
+            row = table.iloc[row_idx].astype(str).to_dict()
+            player1 = normalize_space(row.get(player1_col, ""))
+            player2 = normalize_space(row.get(player2_col, ""))
+            score = normalize_score_text(row.get(score_col, "")) if score_col else ""
+            round_value = normalize_space(row.get(round_col, "")) if round_col else ""
+
+            if is_missing_match_value(player1) or is_missing_match_value(player2):
+                continue
+            if not is_player_like(player1) or not is_player_like(player2):
+                continue
+
+            rows.append({
+                **source_meta,
+                "source_parser": "html_table",
+                "table_columns": " | ".join(columns),
+                "table_row_index": row_idx,
+                "player1": player1,
+                "player2": player2,
+                "score": score,
+                "round": round_value,
+                "status": "",
+                "winner": "",
+                "raw_row": json.dumps(row, ensure_ascii=False),
+            })
+
+        return rows
+
     joined_text = " | ".join(table.astype(str).fillna("").head(10).stack().tolist()).lower()
     useful_keywords = ["match", "игрок", "счет", "счёт", "player", "score", "winner", "побед"]
     if not any(keyword in joined_text for keyword in useful_keywords):
@@ -565,7 +647,7 @@ def table_to_match_rows(
                 "table_row_index": row_idx,
                 "player1": player_candidates[0] if len(player_candidates) >= 1 else "",
                 "player2": player_candidates[1] if len(player_candidates) >= 2 else "",
-                "score": score_candidates[0] if score_candidates else "",
+                "score": normalize_score_text(score_candidates[0]) if score_candidates else "",
                 "round": "",
                 "status": "",
                 "winner": "",
@@ -765,22 +847,29 @@ def deduplicate_match_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 def parse_one_html_file(html_path: str, source_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     html_text = Path(html_path).read_text(encoding="utf-8", errors="ignore")
-    all_rows: List[Dict[str, Any]] = []
 
     # 1) Таблицы
+    table_rows: List[Dict[str, Any]] = []
     tables = extract_tables_from_html(html_text)
+    saw_match_table = False
     for table in tables:
-        all_rows.extend(table_to_match_rows(table, source_meta))
+        saw_match_table = saw_match_table or has_match_table_columns(table)
+        table_rows.extend(table_to_match_rows(table, source_meta))
+
+    if table_rows or saw_match_table:
+        return table_rows
 
     # 2) JSON из скриптов
+    json_rows: List[Dict[str, Any]] = []
     json_objects = extract_json_objects_from_scripts(html_text)
     for obj in json_objects:
-        all_rows.extend(json_object_to_match_rows(obj, source_meta))
+        json_rows.extend(json_object_to_match_rows(obj, source_meta))
+
+    if json_rows:
+        return json_rows
 
     # 3) DOM-блоки
-    all_rows.extend(extract_dom_card_rows(html_text, source_meta))
-
-    return all_rows
+    return extract_dom_card_rows(html_text, source_meta)
 
 def parse_saved_htmls(save_log_df: pd.DataFrame) -> pd.DataFrame:
     match_rows: List[Dict[str, Any]] = []

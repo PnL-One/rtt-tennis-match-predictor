@@ -23,7 +23,7 @@
 Последний сохраненный прогон модели:
 
 ```text
-assembled_predictor/model_results/run_20260512_141002
+assembled_predictor/model_results/run_20260514_163444
 ```
 
 Краткая сводка последнего прогона:
@@ -35,24 +35,25 @@ assembled_predictor/model_results/run_20260512_141002
 | Строк в feature dataset | 15118 |
 | Матчей в train | 6326 |
 | Матчей в test | 1233 |
-| Уникальных игроков | 2049 |
+| Уникальных игроков | 1315 |
 | Уникальных турниров | 149 |
+| Покрытие РНИ player1 / player2 | 100.0% / 100.0% |
 | Признаков финальной модели | 43 |
-| Production-модель | GradientBoostingClassifier |
+| Production-модель | CatBoostClassifier |
 
 ## Качество Моделей
 
-Модели сравниваются на временном test split. Test-период всегда равен последним 3 месяцам от максимальной даты матча в актуальном датасете. Основной критерий выбора - test LogLoss на match-level symmetrized прогнозе.
+Модели сравниваются на временном test split. Test-период всегда равен последним 3 месяцам от максимальной даты матча в актуальном датасете. Основной критерий выбора - test LogLoss на match-level symmetrized прогнозе. Параметры CatBoost, GBM и Random Forest подбираются на внутренней time-based validation-части train-периода, без перемешивания временных данных и без использования final test. Вероятности CatBoost дополнительно калибруются sigmoid/Platt-калибратором на внутренней validation-части train.
 
 | Модель | LogLoss | Brier | ROC-AUC | Accuracy |
 | --- | ---: | ---: | ---: | ---: |
-| Gradient Boosting | 0.4557 | 0.1498 | 0.8658 | 0.7810 |
-| CatBoost | 0.4561 | 0.1501 | 0.8653 | 0.7826 |
-| Random Forest | 0.4621 | 0.1518 | 0.8621 | 0.7721 |
-| Rating + ELO baseline | 0.4942 | 0.1635 | 0.8403 | 0.7575 |
-| ELO only | 0.6003 | 0.2065 | 0.7475 | 0.6918 |
+| CatBoost | 0.4377 | 0.1433 | 0.8766 | 0.7875 |
+| Gradient Boosting | 0.4387 | 0.1436 | 0.8772 | 0.7867 |
+| Random Forest | 0.4413 | 0.1441 | 0.8754 | 0.7794 |
+| Rating + ELO baseline | 0.4810 | 0.1579 | 0.8513 | 0.7616 |
+| Linear Regression full features | 0.5050 | 0.1499 | 0.8663 | 0.7737 |
 
-В последнем прогоне лучшей моделью по LogLoss стал `GradientBoostingClassifier`. Подробнее см. [docs/model_report.md](docs/model_report.md).
+В последнем прогоне с перекалибровкой лучшей production-моделью по LogLoss стал `CatBoostClassifier` с параметрами, выбранными через time-based grid search. Linear Regression добавлена как дополнительный бенчмарк и не участвует в выборе production-модели. Подробнее см. [docs/model_report.md](docs/model_report.md).
 
 ## Основные Признаки
 
@@ -97,6 +98,7 @@ notebooks/00_data_control_panel.ipynb
 ```text
 .
 ├── assembled_predictor/
+│   ├── model_selection_settings.json
 │   └── predictor_model_dataset_from_parsers.xlsx
 ├── data/
 │   ├── README.md
@@ -104,7 +106,6 @@ notebooks/00_data_control_panel.ipynb
 │   └── tournaments_master.xlsx
 ├── docs/
 │   ├── model_report.md
-│   ├── RTT_tennis_match_predictor_presentation.pptx
 │   └── Пояснительная_записка_RTT_tennis_predictor_updated_v14.docx
 ├── notebooks/
 │   ├── 00_data_control_panel.ipynb
@@ -112,6 +113,8 @@ notebooks/00_data_control_panel.ipynb
 │   ├── 02_parse_rankings.ipynb
 │   ├── 03_build_final_dataset.ipynb
 │   └── 04_train_final_model.ipynb
+├── rtt_predictor/
+│   └── model_wrappers.py
 ├── scripts/
 │   ├── parse_rtt_calendar.py
 │   ├── parse_rtt_matches.py
@@ -153,6 +156,12 @@ python scripts/run_full_pipeline.py
 python scripts/run_full_pipeline.py --continue-on-calendar-error
 ```
 
+По умолчанию полный пайплайн использует последние сохраненные параметры CatBoost, GBM и Random Forest. Для повторного подбора гиперпараметров нужно запустить:
+
+```bash
+python scripts/run_full_pipeline.py --model-selection-mode recalibrate
+```
+
 ## Данные
 
 Ключевые файлы данных:
@@ -160,6 +169,7 @@ python scripts/run_full_pipeline.py --continue-on-calendar-error
 - `data/tournaments_master.xlsx` - мастер-список турниров, используется парсером матчей;
 - `data/data_manifest.json` - статусный снимок свежести данных;
 - `assembled_predictor/predictor_model_dataset_from_parsers.xlsx` - финальный датасет для обучения модели.
+- `assembled_predictor/model_selection_settings.json` - последние выбранные параметры CatBoost, GBM и Random Forest для быстрого переобучения без повторного grid search.
 
 Обновить статус данных можно так:
 
@@ -196,7 +206,7 @@ python scripts/verify_project.py
 
 - [docs/model_report.md](docs/model_report.md) - технический отчет по данным, признакам и качеству моделей.
 - `docs/Пояснительная_записка_RTT_tennis_predictor_updated_v14.docx` - пояснительная записка для сдачи дипломного проекта.
-- `docs/RTT_tennis_match_predictor_presentation.pptx` - презентация к защите.
+- `docs/RTT_tennis_match_predictor_presentation.pptx` - локальная презентация к защите; файл не отслеживается Git, чтобы не утяжелять репозиторий.
 
 ## Ограничения
 

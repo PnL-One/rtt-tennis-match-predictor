@@ -70,13 +70,31 @@ def main() -> None:
     parser.add_argument("--skip-dataset", action="store_true", help="Skip final dataset build.")
     parser.add_argument("--skip-training", action="store_true", help="Skip model training.")
     parser.add_argument("--continue-on-calendar-error", action="store_true", help="Continue with existing tournament master if RTT calendar is temporarily unavailable.")
+    parser.add_argument(
+        "--model-selection-mode",
+        choices=["reuse", "recalibrate"],
+        default="reuse",
+        help=(
+            "reuse: train with latest saved model-selection settings; "
+            "recalibrate: rerun CatBoost/GBM/RF time-based grid search."
+        ),
+    )
+    parser.add_argument(
+        "--recalibrate-model-selection",
+        action="store_true",
+        help="Shortcut for --model-selection-mode recalibrate.",
+    )
     parser.add_argument("--check-only", action="store_true", help="Only check dependencies and exit.")
     args = parser.parse_args()
+
+    if args.recalibrate_model_selection:
+        args.model_selection_mode = "recalibrate"
 
     print("Full RTT predictor pipeline")
     print(f"Started at: {datetime.now(timezone.utc).isoformat()}")
     print(f"Project root: {PROJECT_ROOT}")
     print(f"Project Python: {PROJECT_PYTHON}")
+    print(f"Model selection mode: {args.model_selection_mode}")
 
     preflight_check(args)
     if args.check_only:
@@ -101,13 +119,22 @@ def main() -> None:
         run_step("Build final model dataset", [str(PROJECT_PYTHON), "-u", "scripts/build_final_dataset.py"])
 
     if not args.skip_training:
-        run_step("Train model and save diagnostics", [str(PROJECT_PYTHON), "-u", "scripts/train_model.py"])
+        run_step(
+            "Train model and save diagnostics",
+            [
+                str(PROJECT_PYTHON),
+                "-u",
+                "scripts/train_model.py",
+                "--model-selection-mode",
+                args.model_selection_mode,
+            ],
+        )
 
     run_step("Refresh data manifest", [str(PROJECT_PYTHON), "-u", "scripts/data_status.py", "--write-manifest"])
     run_step("Verify project", [str(PROJECT_PYTHON), "-u", "scripts/verify_project.py"])
 
     print("\nPipeline finished successfully.")
-    print("Open notebooks/04_train_final_model.ipynb and use the final prediction widget for a specific match.")
+    print("Open notebooks/00_data_control_panel.ipynb to review model quality and use the match prediction dashboard.")
 
 
 if __name__ == "__main__":

@@ -209,6 +209,18 @@ def extract_tour_id(source_file: str) -> str:
     return match.group(1) if match else ""
 
 
+def extract_player_profile_id(value: Any) -> str:
+    text = normalize_text(value)
+    if not text:
+        return ""
+
+    if re.fullmatch(r"\d+", text):
+        return text
+
+    match = re.search(r"/ranking/solo/(\d+)", text)
+    return match.group(1) if match else ""
+
+
 # ## 3. Парсинг HTML-страниц матчей из `matches.zip`
 
 # In[5]:
@@ -387,6 +399,91 @@ def parse_match_rows_from_lines(lines: list[str], metadata: dict[str, Any]) -> l
     return rows
 
 
+def extract_match_player_links_from_html(html_text: str) -> dict[str, list[dict[str, str]]]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    links_by_match: dict[str, list[dict[str, str]]] = {}
+    current_match_number = ""
+    current_players: list[dict[str, str]] = []
+
+    def flush_current() -> None:
+        if current_match_number and current_players:
+            links_by_match.setdefault(current_match_number, current_players[:2])
+
+    for tr in soup.find_all("tr"):
+        idx_cell = None
+        for td in tr.find_all("td", recursive=False):
+            classes = td.get("class") or []
+            if any(str(cls) == "match_idx" for cls in classes):
+                idx_cell = td
+                break
+
+        if idx_cell is not None:
+            flush_current()
+            current_match_number = normalize_text(idx_cell.get_text(" ", strip=True))
+            current_players = []
+
+        if not current_match_number:
+            continue
+
+        for anchor in tr.find_all("a", href=True):
+            href = normalize_text(anchor.get("href"))
+            if "/public/ranking/solo/" not in href:
+                continue
+
+            name = normalize_text(anchor.get_text(" ", strip=True))
+            profile_id = extract_player_profile_id(href)
+            if not name or not profile_id:
+                continue
+
+            item = {"name": name, "href": href, "profile_id": profile_id}
+            if item not in current_players:
+                current_players.append(item)
+
+    flush_current()
+    return links_by_match
+
+
+def attach_player_links_to_rows(rows: list[dict[str, Any]], html_text: str) -> list[dict[str, Any]]:
+    links_by_match = extract_match_player_links_from_html(html_text)
+
+    for row in rows:
+        row.setdefault("player1_href", "")
+        row.setdefault("player2_href", "")
+        row.setdefault("player1_profile_id", "")
+        row.setdefault("player2_profile_id", "")
+
+        players = links_by_match.get(normalize_text(row.get("match_number")), [])
+        if not players:
+            continue
+
+        used_indexes: set[int] = set()
+
+        def pick_player_link(raw_name: Any, preferred_index: int) -> dict[str, str]:
+            name = normalize_text(raw_name)
+            for idx, item in enumerate(players):
+                if idx in used_indexes:
+                    continue
+                if normalize_text(item.get("name")) == name:
+                    used_indexes.add(idx)
+                    return item
+
+            if preferred_index < len(players) and preferred_index not in used_indexes:
+                used_indexes.add(preferred_index)
+                return players[preferred_index]
+
+            return {}
+
+        player1_link = pick_player_link(row.get("player1_raw"), 0)
+        player2_link = pick_player_link(row.get("player2_raw"), 1)
+
+        row["player1_href"] = player1_link.get("href", "")
+        row["player1_profile_id"] = player1_link.get("profile_id", "")
+        row["player2_href"] = player2_link.get("href", "")
+        row["player2_profile_id"] = player2_link.get("profile_id", "")
+
+    return rows
+
+
 def finalize_parsed_matches(rows: list[dict[str, Any]]) -> pd.DataFrame:
     result = pd.DataFrame(rows)
 
@@ -409,6 +506,7 @@ def parse_matches_html_dir(matches_html_dir: Path) -> pd.DataFrame:
         lines = extract_lines_from_html(html_text)
         metadata = parse_tournament_metadata(lines, html_path.name)
         rows = parse_match_rows_from_lines(lines, metadata)
+        rows = attach_player_links_to_rows(rows, html_text)
         all_rows.extend(rows)
 
     return finalize_parsed_matches(all_rows)
@@ -426,6 +524,7 @@ def parse_matches_zip(matches_zip_path: Path) -> pd.DataFrame:
             lines = extract_lines_from_html(html_text)
             metadata = parse_tournament_metadata(lines, name)
             rows = parse_match_rows_from_lines(lines, metadata)
+            rows = attach_player_links_to_rows(rows, html_text)
             all_rows.extend(rows)
 
     return finalize_parsed_matches(all_rows)
@@ -612,9 +711,56 @@ def load_rating_history(rankings_csv_path: Path) -> pd.DataFrame:
     return rating_history
 
 
+def load_player_profile_to_rni_map(rankings_csv_path: Path) -> dict[str, str]:
+    rankings_csv_path = as_path(rankings_csv_path)
+    raw = pd.read_csv(rankings_csv_path, dtype=str)
+
+    for col in ["rni_final", "rni", "player_href", "player_url"]:
+        if col not in raw.columns:
+            raw[col] = ""
+
+    df = pd.DataFrame({
+        "player_profile_id": raw["player_url"].map(extract_player_profile_id),
+        "player_profile_id_from_href": raw["player_href"].map(extract_player_profile_id),
+        "RNI": raw["rni_final"].where(
+            raw["rni_final"].fillna("").astype(str).str.strip().ne(""),
+            raw["rni"],
+        ).map(normalize_rni),
+    })
+
+    df["player_profile_id"] = df["player_profile_id"].where(
+        df["player_profile_id"].ne(""),
+        df["player_profile_id_from_href"],
+    )
+    df = df[df["player_profile_id"].ne("") & df["RNI"].ne("")].copy()
+
+    if df.empty:
+        return {}
+
+    grouped = (
+        df
+        .groupby("player_profile_id")["RNI"]
+        .agg(lambda values: sorted(set(values)))
+        .reset_index(name="rni_candidates")
+    )
+
+    conflicts = grouped[grouped["rni_candidates"].map(len).gt(1)].copy()
+    if not conflicts.empty:
+        print(f"WARNING: player profile id -> RNI conflicts: {len(conflicts)}")
+        display(conflicts.head(10))
+
+    resolved = grouped[grouped["rni_candidates"].map(len).eq(1)].copy()
+    return {
+        str(row["player_profile_id"]): row["rni_candidates"][0]
+        for _, row in resolved.iterrows()
+    }
+
+
 rating_history = load_rating_history(RANKINGS_CSV_PATH)
+player_profile_to_rni = load_player_profile_to_rni_map(RANKINGS_CSV_PATH)
 
 print("Rating history rows:", rating_history.shape)
+print("Player profile -> RNI mappings:", len(player_profile_to_rni))
 display(rating_history.head())
 display(
     rating_history
@@ -762,16 +908,42 @@ display(player_matching.head())
 # In[9]:
 
 
-def attach_rni_to_matches(matches_raw: pd.DataFrame, player_matching: pd.DataFrame) -> pd.DataFrame:
+def attach_rni_to_matches(
+    matches_raw: pd.DataFrame,
+    player_matching: pd.DataFrame,
+    player_profile_to_rni: dict[str, str] | None = None,
+) -> pd.DataFrame:
     out = matches_raw.copy()
+    player_profile_to_rni = player_profile_to_rni or {}
 
     rni_map = player_matching.set_index("raw_name")["RNI"].to_dict()
     status_map = player_matching.set_index("raw_name")["match_status"].to_dict()
 
     for side in ["player1", "player2"]:
+        href_col = f"{side}_href"
+        profile_col = f"{side}_profile_id"
+
+        if href_col not in out.columns:
+            out[href_col] = ""
+        if profile_col not in out.columns:
+            out[profile_col] = ""
+
         out[f"{side}_key"] = out[f"{side}_raw"].map(normalize_player_key)
-        out[f"{side}_RNI"] = out[f"{side}_raw"].map(rni_map).map(normalize_rni)
+        out[profile_col] = out[profile_col].map(extract_player_profile_id).where(
+            out[profile_col].map(extract_player_profile_id).ne(""),
+            out[href_col].map(extract_player_profile_id),
+        )
+
+        rni_from_href = out[profile_col].map(player_profile_to_rni).fillna("").map(normalize_rni)
+        rni_from_name = out[f"{side}_raw"].map(rni_map).map(normalize_rni)
+
+        out[f"{side}_RNI"] = rni_from_href.where(rni_from_href.ne(""), rni_from_name).map(normalize_rni)
         out[f"{side}_match_status"] = out[f"{side}_raw"].map(status_map).fillna("unmatched")
+        out.loc[rni_from_href.ne(""), f"{side}_match_status"] = "matched_by_href"
+        out.loc[
+            rni_from_href.eq("") & out[profile_col].ne("") & rni_from_name.eq(""),
+            f"{side}_match_status",
+        ] = "unmatched_profile_href"
         out[f"{side}_id"] = out[f"{side}_RNI"].map(safe_rni_id)
 
     return out
@@ -847,6 +1019,7 @@ def build_matches_enriched(
     matches_raw: pd.DataFrame,
     player_matching: pd.DataFrame,
     rating_history: pd.DataFrame,
+    player_profile_to_rni: dict[str, str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = matches_raw.copy()
 
@@ -867,7 +1040,7 @@ def build_matches_enriched(
     dropped_invalid_matches = df.loc[invalid_mask].copy()
     df = df.loc[~invalid_mask].copy()
 
-    df = attach_rni_to_matches(df, player_matching)
+    df = attach_rni_to_matches(df, player_matching, player_profile_to_rni)
     df = attach_rating_for_side(df, rating_history, "player1")
     df = attach_rating_for_side(df, rating_history, "player2")
 
@@ -903,6 +1076,7 @@ matches_enriched, dropped_invalid_matches, dropped_duplicate_matches = build_mat
     matches_raw=matches_parsed_raw,
     player_matching=player_matching,
     rating_history=rating_history,
+    player_profile_to_rni=player_profile_to_rni,
 )
 
 print("Matches enriched:", matches_enriched.shape)
