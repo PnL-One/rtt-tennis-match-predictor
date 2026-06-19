@@ -13,3 +13,15 @@ It is intentionally separated from raw saved HTML pages:
 ```bash
 python scripts/data_status.py --write-manifest
 ```
+
+Current manifest snapshot:
+
+| Area | Current value |
+| --- | ---: |
+| Tournaments in master file | 501 |
+| Saved match pages | 507 |
+| Ranking rows | 232487 |
+| Unique ranking RNI | 8686 |
+| Final ML rows | 15764 |
+| Completed matches | 7882 |
+| Match date range | 2025-03-02 - 2026-06-19 |

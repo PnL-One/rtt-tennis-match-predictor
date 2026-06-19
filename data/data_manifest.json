@@ -1,42 +1,42 @@
 {
-  "generated_at": "2026-05-14T13:47:22.343300+00:00",
+  "generated_at": "2026-06-19T20:53:40.074023+00:00",
   "tournaments": {
     "file": {
       "exists": true,
       "path": "data\\tournaments_master.xlsx",
-      "size_bytes": 56297,
-      "modified_at": "2026-05-14T11:23:54.333710+00:00"
+      "size_bytes": 59512,
+      "modified_at": "2026-06-19T20:45:22.876216+00:00"
     },
-    "rows": 473,
-    "unique_tour_ids": 473,
+    "rows": 501,
+    "unique_tour_ids": 501,
     "min_start_date": "2025-03-01",
-    "max_start_date": "2026-07-27",
-    "matches_page_saved_count": 434
+    "max_start_date": "2026-08-29",
+    "matches_page_saved_count": 461
   },
   "saved_pages": {
     "html_dir": "saved_rtt_pages\\html",
-    "html_pages": 480,
-    "latest_html_modified_at": "2026-05-12T05:44:00.333855+00:00"
+    "html_pages": 507,
+    "latest_html_modified_at": "2026-06-19T18:25:30.322496+00:00"
   },
   "rankings": {
     "file": {
       "exists": true,
       "path": "rtt_rankings_saved\\rtt_rankings_all_dates.csv",
-      "size_bytes": 88613123,
-      "modified_at": "2026-05-14T11:25:40.532181+00:00"
+      "size_bytes": 94485063,
+      "modified_at": "2026-06-19T20:46:25.316619+00:00"
     },
-    "rows": 218045,
-    "unique_rni": 8610,
+    "rows": 232487,
+    "unique_rni": 8686,
     "min_ranking_date": "2025-02-01",
-    "max_ranking_date": "2026-05-01",
-    "ranking_date_age_group_pairs": 60
+    "max_ranking_date": "2026-06-01",
+    "ranking_date_age_group_pairs": 64
   },
   "dataset": {
     "file": {
       "exists": true,
       "path": "assembled_predictor\\predictor_model_dataset_from_parsers.xlsx",
-      "size_bytes": 23336479,
-      "modified_at": "2026-05-14T11:30:02.072651+00:00"
+      "size_bytes": 24604102,
+      "modified_at": "2026-06-19T20:50:59.819599+00:00"
     },
     "sheets": [
       "ml_dataset",
@@ -55,21 +55,21 @@
       "build_summary"
     ],
     "coverage": {
-      "completed_matches": 7559.0,
-      "double_entry_rows": 15118.0,
-      "unique_players_in_matches": 1311.0,
-      "matched_players": 1253.0,
-      "ambiguous_players": 40.0,
+      "completed_matches": 7882.0,
+      "double_entry_rows": 15764.0,
+      "unique_players_in_matches": 1318.0,
+      "matched_players": 1259.0,
+      "ambiguous_players": 41.0,
       "unmatched_players": 18.0,
-      "rating_history_rows": 218045.0,
-      "rating_history_unique_rni": 8610.0,
+      "rating_history_rows": 232487.0,
+      "rating_history_unique_rni": 8686.0,
       "player1_rni_match_rate": 1.0,
       "player2_rni_match_rate": 1.0,
-      "player1_rating_coverage": 0.987299907395158,
-      "player2_rating_coverage": 0.9899457600211669
+      "player1_rating_coverage": 0.9878203501649327,
+      "player2_rating_coverage": 0.990357777213905
     },
-    "ml_rows": 15118,
-    "max_match_date": "2026-05-11",
+    "ml_rows": 15764,
+    "max_match_date": "2026-06-19",
     "min_match_date": "2025-03-02"
   }
 }
