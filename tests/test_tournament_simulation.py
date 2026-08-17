@@ -110,6 +110,7 @@ class SimulationTests(unittest.TestCase):
             target_player_ids=["2"],
         )
         self.assertEqual(result.distributions["2"]["1"], 1.0)
+        self.assertEqual(result.encounter_probabilities["2"], {"3": 1.0})
 
 
 if __name__ == "__main__":

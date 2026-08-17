@@ -1,17 +1,17 @@
 {
-  "generated_at": "2026-08-17T04:43:08.072943+00:00",
+  "generated_at": "2026-08-17T19:34:30.227818+00:00",
   "tournaments": {
     "file": {
       "exists": true,
       "path": "data\\tournaments_master.xlsx",
-      "size_bytes": 211081,
-      "modified_at": "2026-08-16T20:46:33.848381+00:00"
+      "size_bytes": 228653,
+      "modified_at": "2026-08-17T19:30:57.299157+00:00"
     },
-    "rows": 1665,
-    "unique_tour_ids": 1665,
+    "rows": 1780,
+    "unique_tour_ids": 1780,
     "min_start_date": "2005-01-03",
-    "max_start_date": "2026-09-21",
-    "matches_page_saved_count": 1635
+    "max_start_date": "2026-12-21",
+    "matches_page_saved_count": 1634
   },
   "saved_pages": {
     "html_dir": "saved_rtt_pages\\html",

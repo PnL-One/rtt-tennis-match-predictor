@@ -83,6 +83,7 @@ class TournamentSnapshot:
     players: list[ParsedPlayer] = field(default_factory=list)
     player_source: str = ""
     grid_slots: list[str | None] = field(default_factory=list)
+    grid_rounds: list[list[str | None]] = field(default_factory=list)
     completed_matches: list[ParsedMatch] = field(default_factory=list)
     eligible: bool = False
     eligibility_reason: str = ""
@@ -126,8 +127,10 @@ class _RenderedHTMLParser(HTMLParser):
         self._cell_parts: list[str] | None = None
         self._cell_links: list[tuple[str, str]] = []
         self.grid_first_round_cells: list[tuple[str, str]] = []
+        self.grid_round_cells: dict[int, list[tuple[str, str]]] = {}
         self._div_classes: list[set[str]] = []
         self._grid_round0_depth: int | None = None
+        self._grid_round_index: int | None = None
         self._grid_cell_depth: int | None = None
         self._grid_slot_depth: int | None = None
         self._grid_slot_side = ""
@@ -144,8 +147,10 @@ class _RenderedHTMLParser(HTMLParser):
             classes = set(attrs_dict.get("class", "").split())
             self._div_classes.append(classes)
             depth = len(self._div_classes)
-            if {"cell-wrapper", "round0"}.issubset(classes):
+            round_class = next((value for value in classes if re.fullmatch(r"round\d+", value)), "")
+            if "cell-wrapper" in classes and round_class:
                 self._grid_round0_depth = depth
+                self._grid_round_index = int(round_class.removeprefix("round"))
             elif (
                 self._grid_round0_depth is not None
                 and "TourGridCell" in classes
@@ -186,16 +191,19 @@ class _RenderedHTMLParser(HTMLParser):
                 self._grid_slot_side = ""
             if self._grid_cell_depth == depth:
                 if self._grid_cell_parts is not None:
-                    self.grid_first_round_cells.append(
-                        (
-                            normalize_space(" ".join(self._grid_cell_parts["top"])),
-                            normalize_space(" ".join(self._grid_cell_parts["bottom"])),
-                        )
+                    cell = (
+                        normalize_space(" ".join(self._grid_cell_parts["top"])),
+                        normalize_space(" ".join(self._grid_cell_parts["bottom"])),
                     )
+                    if self._grid_round_index is not None:
+                        self.grid_round_cells.setdefault(self._grid_round_index, []).append(cell)
+                    if self._grid_round_index == 0:
+                        self.grid_first_round_cells.append(cell)
                 self._grid_cell_depth = None
                 self._grid_cell_parts = None
             if self._grid_round0_depth == depth:
                 self._grid_round0_depth = None
+                self._grid_round_index = None
             self._div_classes.pop()
         if tag == "a" and self._anchor_href:
             text = normalize_space(" ".join(self._anchor_parts))
@@ -530,50 +538,88 @@ def parse_matches(html: str) -> list[ParsedMatch]:
     return matches
 
 
+def _player_id_from_grid_text(value: str, players: Sequence[ParsedPlayer]) -> str | None:
+    tokens = re.findall(r"[0-9a-zа-я]+", normalize_name(value))
+    if not tokens or any(token in {"x", "bye", "свободен"} for token in tokens):
+        return None
+    matches: list[str] = []
+    for player in players:
+        player_tokens = re.findall(r"[0-9a-zа-я]+", normalize_name(player.name))
+        if len(player_tokens) < 2:
+            continue
+        surname = player_tokens[0]
+        expected_initials = tuple(token[0] for token in player_tokens[1:3])
+        for index, token in enumerate(tokens):
+            following = tokens[index + 1:index + 1 + len(expected_initials)]
+            if (
+                token == surname
+                and len(following) == len(expected_initials)
+                and tuple(part[0] for part in following) == expected_initials
+            ):
+                matches.append(player.player_id)
+                break
+    unique_matches = list(dict.fromkeys(matches))
+    return unique_matches[0] if len(unique_matches) == 1 else ""
+
+
+def _parse_div_grid_rounds(
+    parsed: _RenderedHTMLParser,
+    players: Sequence[ParsedPlayer],
+) -> list[list[str | None]]:
+    if 0 not in parsed.grid_round_cells:
+        return []
+    player_ids = {player.player_id for player in players}
+    rounds: list[list[str | None]] = []
+    expected_size = 0
+    for round_index in range(max(parsed.grid_round_cells) + 1):
+        cells = parsed.grid_round_cells.get(round_index)
+        if cells is None:
+            break
+        slots: list[str | None] = []
+        ambiguous = False
+        for top, bottom in cells:
+            for value in (top, bottom):
+                player_id = _player_id_from_grid_text(value, players)
+                if player_id == "":
+                    ambiguous = True
+                    break
+                slots.append(player_id)
+            if ambiguous:
+                break
+        if ambiguous:
+            break
+        if round_index == 0:
+            expected_size = len(slots)
+            valid_size = expected_size in (4, 8, 16, 32)
+        else:
+            expected_size //= 2
+            valid_size = len(slots) == expected_size
+        present = [value for value in slots if value is not None]
+        valid_players = (
+            len(present) == len(set(present))
+            and set(present).issubset(player_ids)
+            and (round_index > 0 or set(present) == player_ids)
+        )
+        if not valid_size or not valid_players:
+            break
+        rounds.append(slots)
+    return rounds
+
+
+def parse_grid_rounds(html: str, players: Sequence[ParsedPlayer]) -> list[list[str | None]]:
+    """Parse every published column of an RTT Olympic draw."""
+
+    return _parse_div_grid_rounds(parse_rendered_html(html), players)
+
+
 def parse_grid_slots(html: str, players: Sequence[ParsedPlayer]) -> list[str | None]:
-    """Parse simple row-numbered RTT grid tables when the public view exposes one."""
+    """Parse the initial slots of an RTT draw."""
 
     parsed = parse_rendered_html(html)
     by_name = {normalize_name(player.name): player.player_id for player in players}
-
-    def player_id_from_grid_text(value: str) -> str | None:
-        tokens = re.findall(r"[0-9a-zа-я]+", normalize_name(value))
-        if not tokens or any(token in {"x", "bye", "свободен"} for token in tokens):
-            return None
-        matches: list[str] = []
-        for player in players:
-            player_tokens = re.findall(r"[0-9a-zа-я]+", normalize_name(player.name))
-            if len(player_tokens) < 2:
-                continue
-            surname = player_tokens[0]
-            expected_initials = tuple(token[0] for token in player_tokens[1:3])
-            for index, token in enumerate(tokens):
-                following = tokens[index + 1:index + 1 + len(expected_initials)]
-                if (
-                    token == surname
-                    and len(following) == len(expected_initials)
-                    and tuple(part[0] for part in following) == expected_initials
-                ):
-                    matches.append(player.player_id)
-                    break
-        unique_matches = list(dict.fromkeys(matches))
-        return unique_matches[0] if len(unique_matches) == 1 else ""
-
-    if parsed.grid_first_round_cells:
-        slots: list[str | None] = []
-        for top, bottom in parsed.grid_first_round_cells:
-            for value in (top, bottom):
-                player_id = player_id_from_grid_text(value)
-                if player_id == "":
-                    return []
-                slots.append(player_id)
-        present = [value for value in slots if value is not None]
-        if (
-            len(slots) in (4, 8, 16, 32)
-            and len(present) == len(set(present))
-            and set(present) == set(by_name.values())
-        ):
-            return slots
+    rounds = _parse_div_grid_rounds(parsed, players)
+    if rounds:
+        return rounds[0]
 
     for table in parsed.tables:
         rows: dict[int, str | None] = {}
@@ -696,7 +742,14 @@ def build_snapshot_from_pages(
         metadata.get("end_date", ""),
         today=today,
     )
-    grid_slots = parse_grid_slots(pages.get("grid", ""), selected) if pages.get("grid") and selected else []
+    grid_rounds = parse_grid_rounds(pages.get("grid", ""), selected) if pages.get("grid") and selected else []
+    grid_slots = (
+        grid_rounds[0]
+        if grid_rounds
+        else parse_grid_slots(pages.get("grid", ""), selected)
+        if pages.get("grid") and selected
+        else []
+    )
     completed = parse_matches(pages.get("matches", "")) if pages.get("matches") else []
     if grid_slots:
         player_source += "+official_grid"
@@ -707,6 +760,7 @@ def build_snapshot_from_pages(
         players=selected,
         player_source=player_source,
         grid_slots=grid_slots,
+        grid_rounds=grid_rounds,
         completed_matches=completed,
         eligible=eligible,
         eligibility_reason=eligibility_reason,

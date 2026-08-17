@@ -283,6 +283,19 @@ def _optional_float(value: object) -> float | None:
     return number if np.isfinite(number) else None
 
 
+def registration_status_allows_application(value: object) -> bool:
+    """Return whether a player could still submit an RTT application now."""
+
+    status = normalize_name(value)
+    return "заяв" in status
+
+
+def registration_status_needs_verification(value: object) -> bool:
+    """Return whether the calendar status is missing and needs a fresh RTT card."""
+
+    return normalize_name(value) in {"", "unknown", "все"}
+
+
 def prepare_registration_scenario(
     bundle: dict,
     snapshot: TournamentSnapshot,
@@ -301,6 +314,10 @@ def prepare_registration_scenario(
     if snapshot.grid_slots or snapshot.completed_matches:
         raise ValueError(
             "игрок не заявлен, а официальная сетка уже опубликована или матчи уже начались"
+        )
+    if not registration_status_allows_application(snapshot.status):
+        raise ValueError(
+            f"игрок не заявлен, а статус «{snapshot.status}» не допускает новую заявку"
         )
 
     lookup = prediction.resolve_player_id_by_name(bundle["long_feat"], target_name)
@@ -397,24 +414,54 @@ def _completed_winners(
     snapshot: TournamentSnapshot,
     players: Sequence[TournamentPlayer],
 ) -> tuple[dict[frozenset[str], str], list[str]]:
-    by_name: dict[str, str] = {}
-    for player in players:
-        by_name[normalize_name(player.name)] = str(player.player_id)
-        source_name = str(player.metadata.get("source_player_name", ""))
-        if source_name:
-            by_name[normalize_name(source_name)] = str(player.player_id)
+    def player_id_for(match_name: str) -> str | None:
+        try:
+            return str(_find_target(players, match_name).player_id)
+        except KeyError:
+            return None
+
     completed: dict[frozenset[str], str] = {}
     warnings: list[str] = []
+
+    def lock_winner(player1_id: str, player2_id: str, winner_id: str, source: str) -> None:
+        pair = frozenset((player1_id, player2_id))
+        previous = completed.get(pair)
+        if previous is not None and previous != winner_id:
+            warnings.append(f"Противоречивый победитель матча {source}.")
+            return
+        completed[pair] = winner_id
+
     for match in snapshot.completed_matches:
-        player1_id = by_name.get(normalize_name(match.player1))
-        player2_id = by_name.get(normalize_name(match.player2))
-        winner_id = by_name.get(normalize_name(match.winner))
+        player1_id = player_id_for(match.player1)
+        player2_id = player_id_for(match.player2)
+        winner_id = player_id_for(match.winner)
         if player1_id and player2_id and winner_id in {player1_id, player2_id}:
-            completed[frozenset((player1_id, player2_id))] = winner_id
+            lock_winner(player1_id, player2_id, winner_id, f"{match.player1} — {match.player2}")
         elif match.winner:
             warnings.append(
                 f"Не удалось зафиксировать сыгранный матч: {match.player1} — {match.player2}, победитель {match.winner}."
             )
+
+    source_to_model = {
+        str(player.metadata.get("source_player_id", player.player_id)): str(player.player_id)
+        for player in players
+    }
+    for current_round, next_round in zip(snapshot.grid_rounds, snapshot.grid_rounds[1:]):
+        for match_index, advanced_source_id in enumerate(next_round):
+            if advanced_source_id is None:
+                continue
+            player1_source_id = current_round[2 * match_index]
+            player2_source_id = current_round[2 * match_index + 1]
+            if player1_source_id is None or player2_source_id is None:
+                continue
+            if advanced_source_id not in {player1_source_id, player2_source_id}:
+                warnings.append("Опубликованная сетка содержит несогласованное продвижение игрока.")
+                continue
+            player1_id = source_to_model.get(str(player1_source_id))
+            player2_id = source_to_model.get(str(player2_source_id))
+            winner_id = source_to_model.get(str(advanced_source_id))
+            if player1_id and player2_id and winner_id:
+                lock_winner(player1_id, player2_id, winner_id, "в опубликованной сетке")
     return completed, warnings
 
 
@@ -586,10 +633,15 @@ def eligible_tour_ids_from_master(
     start = pd.to_datetime(frame.get("start_date"), errors="coerce")
     status = frame.get("status", pd.Series("", index=frame.index)).fillna("").astype(str).map(normalize_name)
     terminal = status.str.contains("заверш|сдача отч|отмен|не состоя|аннулир", regex=True)
-    # Keep every future tournament from the master. The short look-back retains
-    # tournaments currently in progress; cached real entries are merged separately.
-    window = start.ge(pd.Timestamp(today) - pd.Timedelta(days=7))
-    mask = window & ~terminal
+    # The master contributes only tournaments where a new application may still
+    # be submitted. Already-entered active tournaments are merged from cache by
+    # ``cached_registered_tour_ids``.
+    future_or_today = start.ge(pd.Timestamp(today))
+    application_candidate = status.map(
+        lambda value: registration_status_allows_application(value)
+        or registration_status_needs_verification(value)
+    )
+    mask = future_or_today & ~terminal & application_candidate
     requested_values = [age_group] if isinstance(age_group, str) else list(age_group or [])
     requested_ages = {normalize_age_group(value) for value in requested_values if normalize_age_group(value)}
     if requested_ages and "age_category" in frame.columns:

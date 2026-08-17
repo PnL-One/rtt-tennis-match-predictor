@@ -543,16 +543,18 @@ def simulate_tournament(
 
                 id_a = str(player_a.player_id)
                 id_b = str(player_b.player_id)
-                if id_a in targets:
-                    encounter_counts[id_a][id_b] += 1
-                if id_b in targets:
-                    encounter_counts[id_b][id_a] += 1
-
                 pair = frozenset((id_a, id_b))
                 locked_winner = locked.get(pair)
                 if locked_winner is not None:
                     winner = player_a if str(locked_winner) == id_a else player_b
                 else:
+                    # Completed matches are replayed only to advance their known
+                    # winner through the bracket.  They are not possible future
+                    # encounters and must not appear in the opponents forecast.
+                    if id_a in targets:
+                        encounter_counts[id_a][id_b] += 1
+                    if id_b in targets:
+                        encounter_counts[id_b][id_a] += 1
                     probability_a = float(probability_provider(player_a, player_b))
                     if not math.isfinite(probability_a) or not 0.0 <= probability_a <= 1.0:
                         raise ValueError(

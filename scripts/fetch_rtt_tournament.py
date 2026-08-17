@@ -131,6 +131,27 @@ async def wait_for_player_sections(page, route_key: str, timeout_ms: int) -> Non
     )
 
 
+async def wait_for_grid_section(page, route_key: str, timeout_ms: int) -> None:
+    """Wait until the asynchronously rendered draw replaces its loading shell."""
+
+    if route_key != "grid":
+        return
+    await page.wait_for_function(
+        r"""() => {
+            const root = document.querySelector('.content-area');
+            if (!root) return false;
+            if (root.querySelector('.cell-wrapper.round0 .TourGridCell.cell-pointer')) return true;
+            const text = (root.innerText || '').replace(/\s+/g, ' ').toLocaleLowerCase('ru');
+            const loading = text.includes('загрузка...') ||
+                Boolean(root.querySelector('.v-progress-circular--indeterminate'));
+            const explicitlyEmpty = Boolean(root.querySelector('.TourEmptyInfo')) ||
+                ['нет данных', 'не сформирована', 'отсутствует'].some(marker => text.includes(marker));
+            return !loading && explicitlyEmpty;
+        }""",
+        timeout=timeout_ms,
+    )
+
+
 async def expand_player_panels(page, route_key: str, timeout_ms: int) -> list[str]:
     """Open RTT's lazy player accordions and retain every rendered table.
 
@@ -239,6 +260,7 @@ async def fetch_route(context, tour_id: str, route: str, cache_dir: Path, timeou
         body_normalized = " ".join(body_text.split()).casefold()
         if len(body_normalized) < 80 or "турнира undefined" in body_normalized:
             raise RuntimeError("RTT page did not return tournament data")
+        await wait_for_grid_section(page, key, timeout_ms)
         await wait_for_player_sections(page, key, timeout_ms)
         player_fragments = await expand_player_panels(page, key, timeout_ms)
         html = append_html_fragments(await page.content(), player_fragments)

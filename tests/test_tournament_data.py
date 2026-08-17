@@ -9,6 +9,7 @@ from rtt_predictor.tournament_data import (
     build_snapshot_from_pages,
     load_snapshot,
     parse_metadata,
+    parse_grid_rounds,
     parse_grid_slots,
     parse_players,
     tournament_eligibility,
@@ -94,10 +95,23 @@ class TournamentDataTests(unittest.TestCase):
             <div class="cell-player cell-bottom">X</div>
           </div>
         </div>
+        <div class="cell-wrapper round1">
+          <div class="TourGridCell cell-pointer">
+            <div class="cell-player cell-top">6 Рыжикова А.А. Москва</div>
+            <div class="cell-player cell-bottom">4 СИ Лисица А.С. BLR</div>
+          </div>
+        </div>
         """
         self.assertEqual(
             parse_grid_slots(html, players),
             ["RNI:44228", "RNI:49799", "RNI:51572", None],
+        )
+        self.assertEqual(
+            parse_grid_rounds(html, players),
+            [
+                ["RNI:44228", "RNI:49799", "RNI:51572", None],
+                ["RNI:49799", "RNI:51572"],
+            ],
         )
 
     def test_snapshot_projects_requests_when_members_absent(self) -> None:

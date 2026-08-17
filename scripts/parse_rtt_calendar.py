@@ -30,7 +30,21 @@ DEFAULT_MASTER_PATH = PROJECT_ROOT / "data" / "tournaments_master.xlsx"
 DEBUG_DIR = PROJECT_ROOT / "data" / "calendar_debug"
 
 DEFAULT_CALENDAR_DATE_FROM = date(2025, 3, 1)
+DEFAULT_CALENDAR_FUTURE_DAYS = 180
 DEFAULT_AGE_CATEGORIES = ["до 15 лет", "до 17 лет", "до 19 лет", "Взрослые"]
+CALENDAR_TOURNAMENT_STATUSES = (
+    "Турнир завершен",
+    "Не состоялся",
+    "Сдача отчета",
+    "В процессе проведения",
+    "Готов к проведению",
+    "Жеребьевка",
+    "Жеребьёвка",
+    "Формирование состава",
+    "Подача поздних заявок",
+    "Подача заявок",
+    "Регистрация",
+)
 SHORT_TIMEOUT_MS = 3_000
 WAIT_AFTER_ACTION_MS = 700
 DETAIL_PAGE_RESET_EVERY = 200
@@ -76,6 +90,18 @@ def parse_cli_date(value: str) -> date:
 
 def default_date_from(master_path: Path) -> date:
     return DEFAULT_CALENDAR_DATE_FROM
+
+
+def default_calendar_date_to(
+    today: date | None = None,
+    *,
+    future_days: int = DEFAULT_CALENDAR_FUTURE_DAYS,
+) -> date:
+    """Include announced future tournaments in the persistent calendar master."""
+
+    if future_days < 0:
+        raise ValueError("future_days must be non-negative")
+    return (today or date.today()) + timedelta(days=future_days)
 
 
 def iter_month_windows(date_from: date, date_to: date) -> Iterable[tuple[date, date]]:
@@ -339,14 +365,7 @@ def parse_calendar_html(html: str, config: CalendarConfig, age_category: str, fe
         start_date = guess_start_date(context_text)
         city = guess_city(context_text) or config.city or pd.NA
         status = config.status
-        for candidate_status in (
-            "Турнир завершен",
-            "В процессе проведения",
-            "Сдача отчета",
-            "Подача поздних заявок",
-            "Подача заявок",
-            "Не состоялся",
-        ):
+        for candidate_status in CALENDAR_TOURNAMENT_STATUSES:
             if candidate_status.lower() in context_text.lower():
                 status = candidate_status
                 break
@@ -440,7 +459,7 @@ def parse_tournament_detail_html_regex(html: str, row: dict, config: CalendarCon
             row[column] = value
 
     status_text = strip_html(html)
-    for status in ("Турнир завершен", "Не состоялся", "Сдача отчета", "В процессе проведения", "Подача поздних заявок", "Подача заявок"):
+    for status in CALENDAR_TOURNAMENT_STATUSES:
         if status in status_text:
             row["status"] = status
             break
@@ -507,7 +526,7 @@ def parse_tournament_detail_html(
     row["system"] = labels.get("Система проведения", row.get("system", config.system))
 
     status_text = normalize_text(soup.get_text(" "))
-    for status in ("Турнир завершен", "Не состоялся", "Сдача отчета", "В процессе проведения", "Подача поздних заявок", "Подача заявок"):
+    for status in CALENDAR_TOURNAMENT_STATUSES:
         if status in status_text:
             row["status"] = status
             break
@@ -1237,7 +1256,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Parse RTT tournament calendar and update data/tournaments_master.xlsx.")
     parser.add_argument("--master", type=Path, default=DEFAULT_MASTER_PATH, help="Tournament master Excel path.")
     parser.add_argument("--date-from", type=parse_cli_date, default=None, help="Calendar start date: DD.MM.YYYY or YYYY-MM-DD.")
-    parser.add_argument("--date-to", type=parse_cli_date, default=date.today(), help="Calendar end date: DD.MM.YYYY or YYYY-MM-DD.")
+    parser.add_argument(
+        "--date-to",
+        type=parse_cli_date,
+        default=None,
+        help="Calendar end date: DD.MM.YYYY or YYYY-MM-DD. Overrides --future-days.",
+    )
+    parser.add_argument(
+        "--future-days",
+        type=int,
+        default=DEFAULT_CALENDAR_FUTURE_DAYS,
+        help=(
+            "When --date-to is omitted, retain announced tournaments this many days ahead "
+            f"(default: {DEFAULT_CALENDAR_FUTURE_DAYS})."
+        ),
+    )
     parser.add_argument("--age", action="append", default=None, help="Age category. Can be repeated or comma-separated.")
     parser.add_argument("--federal-district", default="Все")
     parser.add_argument("--gender", default="Женский")
@@ -1249,11 +1282,13 @@ def main() -> None:
     parser.add_argument("--city", default=None)
     parser.add_argument("--headed", action="store_true", help="Show browser window while parsing.")
     args = parser.parse_args()
+    if args.future_days < 0:
+        parser.error("--future-days must be non-negative")
 
     master_path = args.master if args.master.is_absolute() else PROJECT_ROOT / args.master
     config = CalendarConfig(
         date_from=args.date_from or default_date_from(master_path),
-        date_to=args.date_to,
+        date_to=args.date_to or default_calendar_date_to(future_days=args.future_days),
         status=args.status,
         draw_type=args.draw_type,
         gender=args.gender,

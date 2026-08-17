@@ -6,8 +6,9 @@ from datetime import date
 
 import pandas as pd
 
-from rtt_predictor.tournament_data import ParsedPlayer, TournamentSnapshot
+from rtt_predictor.tournament_data import ParsedMatch, ParsedPlayer, TournamentSnapshot
 from rtt_predictor.tournament_mode import (
+    _completed_winners,
     _find_target,
     cached_registered_tour_ids,
     current_rating_age_groups,
@@ -46,6 +47,69 @@ class TargetPlayerLookupTests(unittest.TestCase):
             _find_target(players, "Рыжикова А.А.")
 
 
+class CompletedMatchLookupTests(unittest.TestCase):
+    def test_abbreviated_match_names_lock_winner_with_full_roster_names(self) -> None:
+        players = [
+            TournamentPlayer("RNI:44228", "Новикова Ангелина Сергеевна"),
+            TournamentPlayer("RNI:49799", "Рыжикова Анна Антоновна"),
+        ]
+        snapshot = TournamentSnapshot(
+            tour_id="306306",
+            fetched_at="2026-08-17T08:00:00+03:00",
+            completed_matches=[
+                ParsedMatch(
+                    player1="Новикова А.С.",
+                    player2="Рыжикова А.А.",
+                    winner="Рыжикова А.А.",
+                    score="0 - 2 0-6,4-6",
+                )
+            ],
+        )
+
+        completed, warnings = _completed_winners(snapshot, players)
+
+        self.assertEqual(
+            completed,
+            {frozenset(("RNI:44228", "RNI:49799")): "RNI:49799"},
+        )
+        self.assertEqual(warnings, [])
+
+    def test_later_grid_round_infers_walkover_winner(self) -> None:
+        players = [
+            TournamentPlayer("RNI:51572", "Лисица Анна Сергеевна"),
+            TournamentPlayer("RNI:49372", "Воронова Ирина Алексеевна"),
+            TournamentPlayer("RNI:44228", "Новикова Ангелина Сергеевна"),
+            TournamentPlayer("RNI:49799", "Рыжикова Анна Антоновна"),
+        ]
+        snapshot = TournamentSnapshot(
+            tour_id="306306",
+            fetched_at="2026-08-17T20:55:09+03:00",
+            grid_rounds=[
+                ["RNI:51572", "RNI:49372", "RNI:44228", "RNI:49799"],
+                ["RNI:51572", "RNI:49799"],
+            ],
+            completed_matches=[
+                ParsedMatch(
+                    player1="Новикова А.С.",
+                    player2="Рыжикова А.А.",
+                    winner="Рыжикова А.А.",
+                    score="0 - 2 0-6,4-6",
+                )
+            ],
+        )
+
+        completed, warnings = _completed_winners(snapshot, players)
+
+        self.assertEqual(
+            completed,
+            {
+                frozenset(("RNI:44228", "RNI:49799")): "RNI:49799",
+                frozenset(("RNI:51572", "RNI:49372")): "RNI:51572",
+            },
+        )
+        self.assertEqual(warnings, [])
+
+
 class RegistrationScenarioTests(unittest.TestCase):
     def setUp(self) -> None:
         self.bundle = {
@@ -68,6 +132,7 @@ class RegistrationScenarioTests(unittest.TestCase):
             tour_id="1",
             fetched_at="2026-08-16T12:00:00+03:00",
             title="Тест",
+            status="Подача заявок",
             age_group="до 15 лет",
             draw_system="Олимпийская",
             start_date="2026-08-20",
@@ -94,6 +159,18 @@ class RegistrationScenarioTests(unittest.TestCase):
     def test_missing_player_cannot_be_added_after_draw_publication(self) -> None:
         with self.assertRaisesRegex(ValueError, "сетка уже опубликована"):
             prepare_registration_scenario(self.bundle, self.snapshot(grid=True), "Новая Анна Андреевна")
+
+    def test_missing_player_cannot_be_added_after_applications_close(self) -> None:
+        snapshot = self.snapshot()
+        snapshot.status = "Формирование состава"
+        with self.assertRaisesRegex(ValueError, "не допускает новую заявку"):
+            prepare_registration_scenario(self.bundle, snapshot, "Новая Анна Андреевна")
+
+    def test_missing_player_cannot_be_added_with_unknown_application_status(self) -> None:
+        snapshot = self.snapshot()
+        snapshot.status = "unknown"
+        with self.assertRaisesRegex(ValueError, "не допускает новую заявку"):
+            prepare_registration_scenario(self.bundle, snapshot, "Новая Анна Андреевна")
 
     @patch("rtt_predictor.tournament_mode.prediction.rating_snapshot")
     def test_virtual_entry_must_qualify_for_full_application_list(self, rating_snapshot) -> None:
@@ -150,10 +227,31 @@ class MegaTournamentDiscoveryTests(unittest.TestCase):
     def test_master_filter_accepts_multiple_age_groups(self, read_excel) -> None:
         read_excel.return_value = pd.DataFrame(
             {
-                "tour_id": [306306, 306999, 306888, 307500],
-                "start_date": ["2026-08-17", "2026-08-18", "2026-08-19", "2026-12-20"],
-                "status": ["Прием заявок"] * 4,
-                "age_category": ["до 17 лет", "до 19 лет", "до 15 лет", "до 17 лет"],
+                "tour_id": [306306, 306999, 306888, 307500, 307600, 307700],
+                "start_date": [
+                    "2026-08-17",
+                    "2026-08-18",
+                    "2026-08-19",
+                    "2026-12-20",
+                    "2026-09-01",
+                    "2026-09-02",
+                ],
+                "status": [
+                    "Прием заявок",
+                    "Подача поздних заявок",
+                    "Прием заявок",
+                    "unknown",
+                    "Формирование состава",
+                    "В процессе проведения",
+                ],
+                "age_category": [
+                    "до 17 лет",
+                    "до 19 лет",
+                    "до 15 лет",
+                    "до 17 лет",
+                    "до 17 лет",
+                    "до 17 лет",
+                ],
             }
         )
         result = eligible_tour_ids_from_master(
