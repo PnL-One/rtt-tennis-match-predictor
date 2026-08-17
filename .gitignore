@@ -10,6 +10,7 @@ env/
 
 # Parser raw outputs
 saved_rtt_pages/
+tournament_analysis_cache/
 rtt_rankings_saved/
 data/calendar_debug/
 matches_saved/

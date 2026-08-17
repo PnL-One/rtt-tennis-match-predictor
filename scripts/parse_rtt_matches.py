@@ -57,13 +57,14 @@ def Markdown(text):
 # In[2]:
 
 
-from datetime import date
+from datetime import date, datetime, timezone
 from io import StringIO
 from pathlib import Path
 import os
 import re
 import asyncio
 import json
+import argparse
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -108,11 +109,41 @@ PAGE_TIMEOUT_MS = 60000
 WAIT_AFTER_OPEN_SECONDS = 4
 SCROLL_PAUSE_SECONDS = 1.0
 MAX_SCROLL_ROUNDS = 15
+MIN_PROJECT_MATCH_DATE = pd.Timestamp("2025-03-01")
 
 RESULT_EXCEL_PATH = PROJECT_ROOT / "rtt_matches_extracted.xlsx"
 RESULT_CSV_PATH = PROJECT_ROOT / "rtt_matches_extracted.csv"
 FAILED_LINKS_PATH = PROJECT_ROOT / "rtt_failed_links.xlsx"
 SAVE_LOG_PATH = OUTPUT_DIR / "rtt_match_page_save_log.xlsx"
+STALE_AUDIT_PATH = OUTPUT_DIR / "rtt_match_page_stale_audit.xlsx"
+
+CLI_PARSER = argparse.ArgumentParser(description="Download cached/stale RTT match pages and parse match rows.")
+CLI_PARSER.add_argument(
+    "--tour-id",
+    action="append",
+    default=None,
+    help="Only process a specific tournament id. Can be repeated.",
+)
+CLI_PARSER.add_argument(
+    "--force-refresh",
+    action="store_true",
+    help="Redownload selected non-future tournaments even when the cached page is terminal.",
+)
+CLI_PARSER.add_argument(
+    "--audit-only",
+    action="store_true",
+    help="Write the stale-page audit without opening a browser or changing parsed match outputs.",
+)
+CLI_PARSER.add_argument(
+    "--concurrency",
+    type=int,
+    default=4,
+    help="Number of RTT pages downloaded concurrently (default: 4).",
+)
+CLI_ARGS = CLI_PARSER.parse_args()
+if CLI_ARGS.concurrency < 1:
+    CLI_PARSER.error("--concurrency must be at least 1")
+TARGET_TOUR_IDS = {str(value).strip() for value in (CLI_ARGS.tour_id or []) if str(value).strip()}
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 HTML_DIR.mkdir(parents=True, exist_ok=True)
@@ -169,7 +200,13 @@ def build_output_file_base(row_index: int, tournament_name: str, age_category: s
     tour_id = extract_tour_id(url) or f"row_{row_index + 1}"
     tournament_name = sanitize_file_name(tournament_name)
     age_category = sanitize_file_name(age_category)
-    return f"{row_index + 1:04d}_{tour_id}_{tournament_name}_{age_category}"
+    prefix = f"{row_index + 1:04d}_{tour_id}_"
+    suffix = f"_{age_category}" if age_category else ""
+    # Keep the complete absolute path below the traditional Windows MAX_PATH
+    # boundary, including temporary and screenshot suffixes.
+    max_base_length = 120
+    name_budget = max(16, max_base_length - len(prefix) - len(suffix))
+    return f"{prefix}{tournament_name[:name_budget]}{suffix}".rstrip(" ._")
 
 def normalize_status(value: Any) -> str:
     if value is None or pd.isna(value):
@@ -185,6 +222,67 @@ def is_cancelled_status(value: Any) -> bool:
 def is_completed_status(value: Any) -> bool:
     status = normalize_status(value)
     return "заверш" in status
+
+def is_terminal_status(value: Any) -> bool:
+    status = normalize_status(value)
+    return any(marker in status for marker in ("заверш", "не состоял", "отмен", "аннулир"))
+
+def detect_tournament_status_from_html(html_text: str) -> str:
+    if not html_text:
+        return ""
+    status_markers = [
+        ("турнир завершен", "Турнир завершен"),
+        ("не состоялся", "Не состоялся"),
+        ("в процессе проведения", "В процессе проведения"),
+        ("сдача отчета", "Сдача отчета"),
+        ("подача поздних заявок", "Подача поздних заявок"),
+        ("подача заявок", "Подача заявок"),
+        ("отменен", "Турнир отменен"),
+        ("аннулирован", "Турнир аннулирован"),
+    ]
+    raw_text = html_text.lower().replace("ё", "е")
+    for marker, canonical in status_markers:
+        if marker in raw_text:
+            return canonical
+
+    try:
+        page_text = normalize_status(BeautifulSoup(html_text, "html.parser").get_text(" "))
+    except Exception:
+        page_text = normalize_status(re.sub(r"<[^>]+>", " ", html_text))
+    for marker, canonical in status_markers:
+        if marker in page_text:
+            return canonical
+    return ""
+
+def read_cached_page_status(html_path: Path | None) -> str:
+    if html_path is None or not html_path.exists():
+        return ""
+    try:
+        return detect_tournament_status_from_html(html_path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return ""
+
+def file_modified_at_utc(path: Path | None) -> pd.Timestamp:
+    if path is None or not path.exists():
+        return pd.NaT
+    return pd.Timestamp(datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc))
+
+def parse_updated_at_utc(value: Any) -> pd.Timestamp:
+    return pd.to_datetime(value, errors="coerce", utc=True)
+
+def estimate_match_rows_from_html(html_text: str) -> int:
+    if not html_text:
+        return 0
+    try:
+        tables = pd.read_html(StringIO(html_text))
+    except Exception:
+        return 0
+    counts: list[int] = []
+    for table in tables:
+        normalized_columns = {normalize_status(column).replace(" ", "") for column in table.columns.astype(str)}
+        if {"участник1", "участник2"}.issubset(normalized_columns):
+            counts.append(len(table))
+    return max(counts, default=0)
 
 def bool_value(value: Any) -> bool:
     if isinstance(value, bool):
@@ -209,6 +307,9 @@ def resolve_existing_html_path(expected_path: Path, tour_id: str | None) -> Path
 def build_rows_to_process(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows = df[df[LINK_COLUMN_NAME].notna()].copy()
     rows = rows[rows[LINK_COLUMN_NAME].astype(str).str.strip() != ""]
+    if TARGET_TOUR_IDS:
+        row_tour_ids = rows[LINK_COLUMN_NAME].astype(str).map(extract_tour_id)
+        rows = rows[row_tour_ids.isin(TARGET_TOUR_IDS)].copy()
     rows = rows.reset_index(drop=False)
 
     today = pd.Timestamp(date.today())
@@ -217,11 +318,16 @@ def build_rows_to_process(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
     rows["_is_cancelled"] = rows.get("status", pd.Series("", index=rows.index)).map(is_cancelled_status)
     rows["_is_completed"] = rows.get("status", pd.Series("", index=rows.index)).map(is_completed_status)
     rows["_matches_page_saved_bool"] = rows.get("matches_page_saved", pd.Series(False, index=rows.index)).map(bool_value)
+    tournament_names = rows.get("tournament_name", pd.Series("", index=rows.index)).fillna("").astype(str).str.strip()
+    rows["_is_invalid_calendar_placeholder"] = (
+        tournament_names.str.match(r"^RTT tournament \d+$", case=False, na=False)
+        & (rows["_start_date_dt"].isna() | rows["_start_date_dt"].lt(MIN_PROJECT_MATCH_DATE))
+    )
 
     skipped_rows: List[Dict[str, Any]] = []
     process_mask = []
 
-    for _, row in rows.iterrows():
+    for row_index, row in rows.iterrows():
         source_index = int(row["index"])
         tournament_name = str(row.get("tournament_name", row.get("Турнир", ""))).strip()
         age_category = str(row.get("age_category", row.get("Возрастная категория", ""))).strip()
@@ -230,21 +336,52 @@ def build_rows_to_process(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
         file_base = build_output_file_base(source_index, tournament_name, age_category, url)
         expected_html_path = HTML_DIR / f"{file_base}.html"
         cached_html_path = resolve_existing_html_path(expected_html_path, tour_id)
+        cached_page_status = read_cached_page_status(cached_html_path)
+        cached_html_mtime = file_modified_at_utc(cached_html_path)
+        master_updated_at = parse_updated_at_utc(row.get("updated_at", pd.NaT))
 
         skip_reason = ""
         save_status = ""
         use_cached = False
+        refresh_reason = ""
 
-        if row["_is_future"]:
+        if row["_is_invalid_calendar_placeholder"]:
+            skip_reason = "invalid_calendar_placeholder_quarantined"
+            save_status = "skipped_invalid"
+        elif row["_is_future"]:
             skip_reason = "future_start_date"
             save_status = "skipped_future"
         elif row["_is_cancelled"]:
             skip_reason = "cancelled"
             save_status = "skipped_cancelled"
         elif cached_html_path is not None:
-            skip_reason = "cached_html"
-            save_status = "ok"
-            use_cached = True
+            if CLI_ARGS.force_refresh:
+                refresh_reason = "force_refresh"
+            elif is_terminal_status(cached_page_status):
+                skip_reason = "cached_terminal_html"
+                save_status = "ok"
+                use_cached = True
+            elif is_completed_status(row.get("status", "")) and not cached_page_status:
+                cache_is_new_enough = (
+                    pd.notna(cached_html_mtime)
+                    and (pd.isna(master_updated_at) or cached_html_mtime >= master_updated_at)
+                )
+                if cache_is_new_enough:
+                    skip_reason = "cached_after_terminal_master_status"
+                    save_status = "ok"
+                    use_cached = True
+                else:
+                    refresh_reason = "unknown_html_status_before_terminal_master_update"
+            else:
+                refresh_reason = "cached_page_not_terminal"
+        else:
+            refresh_reason = "missing_html"
+
+        rows.at[row_index, "cached_html_path"] = str(cached_html_path or "")
+        rows.at[row_index, "cached_tournament_status"] = cached_page_status
+        rows.at[row_index, "cached_html_mtime"] = cached_html_mtime.isoformat() if pd.notna(cached_html_mtime) else ""
+        rows.at[row_index, "master_updated_at_parsed"] = master_updated_at.isoformat() if pd.notna(master_updated_at) else ""
+        rows.at[row_index, "refresh_reason"] = refresh_reason
 
         if skip_reason:
             skipped_rows.append({
@@ -261,6 +398,12 @@ def build_rows_to_process(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
                 "save_error": "",
                 "skip_reason": skip_reason,
                 "used_cached_html": use_cached,
+                "refresh_reason": refresh_reason,
+                "master_tournament_status": row.get("status", ""),
+                "cached_tournament_status": cached_page_status,
+                "page_tournament_status": cached_page_status,
+                "cached_html_mtime": cached_html_mtime.isoformat() if pd.notna(cached_html_mtime) else "",
+                "master_updated_at": master_updated_at.isoformat() if pd.notna(master_updated_at) else "",
             })
             process_mask.append(False)
         else:
@@ -274,6 +417,9 @@ def build_rows_to_process(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
     )
     if not skipped_df.empty:
         print(skipped_df["skip_reason"].value_counts(dropna=False).to_string())
+    if not rows_to_process.empty:
+        print("Refresh reasons:")
+        print(rows_to_process["refresh_reason"].value_counts(dropna=False).to_string())
     return rows_to_process, skipped_df
 
 async def auto_scroll_page(page) -> None:
@@ -327,6 +473,164 @@ async def click_expand_buttons_if_any(page, max_clicks: int = 8) -> None:
         except Exception:
             pass
 
+async def wait_for_match_table_stability(page, timeout_seconds: int = 20) -> None:
+    """Wait until the rendered match table stops growing for three checks."""
+    previous_count = -1
+    stable_rounds = 0
+    for _ in range(timeout_seconds):
+        try:
+            count = await page.locator("table tbody tr").count()
+        except Exception:
+            count = 0
+        if count == previous_count:
+            stable_rounds += 1
+        else:
+            previous_count = count
+            stable_rounds = 0
+        if stable_rounds >= 3:
+            return
+        await page.wait_for_timeout(1000)
+
+def update_master_from_save_log(master_df: pd.DataFrame, save_log_df: pd.DataFrame) -> pd.DataFrame:
+    if "tour_id" not in master_df.columns or save_log_df.empty:
+        return master_df
+
+    updated_master = master_df.copy()
+    updated_master["tour_id"] = updated_master["tour_id"].astype(str)
+    successful = save_log_df[save_log_df["save_status"].eq("ok")].copy()
+    successful["tour_id"] = successful["tour_id"].astype(str)
+    ok_tour_ids = set(successful["tour_id"].dropna())
+    if ok_tour_ids and "matches_page_saved" in updated_master.columns:
+        updated_master.loc[updated_master["tour_id"].isin(ok_tour_ids), "matches_page_saved"] = True
+
+    now = datetime.now(timezone.utc).isoformat()
+    for log_row in successful.itertuples(index=False):
+        page_status = str(getattr(log_row, "page_tournament_status", "") or "").strip()
+        used_cached = bool(getattr(log_row, "used_cached_html", False))
+        if not page_status:
+            continue
+        mask = updated_master["tour_id"].eq(str(log_row.tour_id))
+        updated_master.loc[mask, "status"] = page_status
+        if not used_cached and "updated_at" in updated_master.columns:
+            updated_master.loc[mask, "updated_at"] = now
+    return updated_master
+
+
+async def download_tournament_row(context, position: int, total: int, row: pd.Series) -> Dict[str, Any]:
+    source_index = int(row["index"])
+    tournament_name = str(row.get("tournament_name", row.get("Турнир", ""))).strip()
+    age_category = str(row.get("age_category", row.get("Возрастная категория", ""))).strip()
+    start_date = str(row.get("start_date", row.get("Дата начала", ""))).strip()
+    city = str(row.get("city", row.get("Город", ""))).strip()
+    url = str(row[LINK_COLUMN_NAME]).strip()
+
+    file_base = build_output_file_base(source_index, tournament_name, age_category, url)
+    cached_path_text = str(row.get("cached_html_path", "")).strip()
+    cached_html_path = Path(cached_path_text) if cached_path_text else None
+    html_path = cached_html_path if cached_html_path and cached_html_path.exists() else HTML_DIR / f"{file_base}.html"
+    screenshot_path = SCREENSHOT_DIR / f"{file_base}.png"
+
+    print(f"[{position}/{total}] opening {url}", flush=True)
+    page = await context.new_page()
+    status = "ok"
+    error_text = ""
+    used_cached_html = False
+    cached_page_status = str(row.get("cached_tournament_status", "") or "").strip()
+    page_tournament_status = ""
+    cached_match_rows = 0
+    downloaded_match_rows = 0
+
+    cached_html_content = ""
+    if html_path.exists():
+        cached_html_content = html_path.read_text(encoding="utf-8", errors="ignore")
+        cached_match_rows = estimate_match_rows_from_html(cached_html_content)
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        try:
+            print(f"[{position}/{total}] waiting for rendered content", flush=True)
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(int(WAIT_AFTER_OPEN_SECONDS * 1000))
+        print(f"[{position}/{total}] expanding and scrolling", flush=True)
+        await click_expand_buttons_if_any(page)
+        await auto_scroll_page(page)
+        await click_expand_buttons_if_any(page)
+        await auto_scroll_page(page)
+        await wait_for_match_table_stability(page)
+
+        print(f"[{position}/{total}] saving html", flush=True)
+        html_content = await page.content()
+        page_tournament_status = detect_tournament_status_from_html(html_content)
+        downloaded_match_rows = estimate_match_rows_from_html(html_content)
+
+        if cached_html_content and downloaded_match_rows < cached_match_rows:
+            used_cached_html = True
+            page_tournament_status = cached_page_status
+            error_text = (
+                "Downloaded page looked incomplete; kept cached HTML "
+                f"({downloaded_match_rows} < {cached_match_rows} match rows)."
+            )
+            print(f"[{position}/{total}] {error_text}", flush=True)
+        else:
+            temporary_html_path = html_path.with_suffix(html_path.suffix + ".tmp")
+            temporary_html_path.write_text(html_content, encoding="utf-8")
+            temporary_html_path.replace(html_path)
+
+        if not used_cached_html:
+            try:
+                print(f"[{position}/{total}] saving screenshot", flush=True)
+                await page.screenshot(path=str(screenshot_path), full_page=True)
+            except Exception:
+                pass
+
+    except PlaywrightTimeoutError:
+        if cached_html_content:
+            status = "ok"
+            used_cached_html = True
+            page_tournament_status = cached_page_status
+            error_text = "PlaywrightTimeoutError; kept cached HTML."
+        else:
+            status = "timeout"
+            error_text = "PlaywrightTimeoutError"
+    except Exception as exc:
+        if cached_html_content:
+            status = "ok"
+            used_cached_html = True
+            page_tournament_status = cached_page_status
+            error_text = f"{exc}; kept cached HTML."
+        else:
+            status = "error"
+            error_text = str(exc)
+    finally:
+        await page.close()
+
+    return {
+        "source_index": source_index,
+        "Турнир": tournament_name,
+        "Возрастная категория": age_category,
+        "Дата начала": start_date,
+        "Город": city,
+        "Ссылка на страницу с матчами": url,
+        "tour_id": extract_tour_id(url),
+        "html_path": str(html_path),
+        "screenshot_path": str(screenshot_path),
+        "save_status": status,
+        "save_error": error_text,
+        "skip_reason": "",
+        "used_cached_html": used_cached_html,
+        "refresh_reason": row.get("refresh_reason", ""),
+        "master_tournament_status": row.get("status", ""),
+        "cached_tournament_status": cached_page_status,
+        "page_tournament_status": page_tournament_status,
+        "cached_html_mtime": row.get("cached_html_mtime", ""),
+        "master_updated_at": row.get("master_updated_at_parsed", ""),
+        "cached_match_rows": cached_match_rows,
+        "downloaded_match_rows": downloaded_match_rows,
+    }
+
 
 # ## 1. Сохранение отрендеренных страниц RTT
 
@@ -340,18 +644,35 @@ async def save_rendered_pages_from_excel(input_excel_path: str) -> pd.DataFrame:
 
     save_log_rows: List[Dict[str, Any]] = []
 
+    if CLI_ARGS.audit_only:
+        audit_columns = [
+            "index",
+            "tour_id",
+            "tournament_name",
+            "age_category",
+            "start_date",
+            "status",
+            "cached_html_path",
+            "cached_tournament_status",
+            "cached_html_mtime",
+            "master_updated_at_parsed",
+            "refresh_reason",
+        ]
+        available_columns = [column for column in audit_columns if column in rows_to_process.columns]
+        audit_df = rows_to_process[available_columns].copy()
+        audit_df.to_excel(STALE_AUDIT_PATH, index=False)
+        print(f"Stale-page audit rows: {len(audit_df)}")
+        print(f"Stale-page audit: {STALE_AUDIT_PATH}")
+        return audit_df
+
     if rows_to_process.empty:
         save_log_df = skipped_df.copy()
         save_log_df.to_excel(SAVE_LOG_PATH, index=False)
+        save_log_df.to_excel(STALE_AUDIT_PATH, index=False)
 
         if TOURNAMENTS_MASTER_PATH.exists() and "tour_id" in df.columns and "matches_page_saved" in df.columns:
-            ok_tour_ids = set(save_log_df.loc[save_log_df["save_status"].eq("ok"), "tour_id"].dropna().astype(str))
-            if ok_tour_ids:
-                updated_master = df.copy()
-                updated_master["tour_id"] = updated_master["tour_id"].astype(str)
-                updated_master.loc[updated_master["tour_id"].isin(ok_tour_ids), "matches_page_saved"] = True
-                updated_master.to_excel(TOURNAMENTS_MASTER_PATH, index=False)
-                print(f"Updated matches_page_saved for {len(ok_tour_ids)} tournaments in {TOURNAMENTS_MASTER_PATH}")
+            updated_master = update_master_from_save_log(df, save_log_df)
+            updated_master.to_excel(TOURNAMENTS_MASTER_PATH, index=False)
 
         return save_log_df
 
@@ -363,74 +684,18 @@ async def save_rendered_pages_from_excel(input_excel_path: str) -> pd.DataFrame:
         )
 
         try:
-            for i, row in rows_to_process.iterrows():
-                source_index = int(row["index"])
-                tournament_name = str(row.get("tournament_name", row.get("Турнир", ""))).strip()
-                age_category = str(row.get("age_category", row.get("Возрастная категория", ""))).strip()
-                start_date = str(row.get("start_date", row.get("Дата начала", ""))).strip()
-                city = str(row.get("city", row.get("Город", ""))).strip()
-                url = str(row[LINK_COLUMN_NAME]).strip()
+            semaphore = asyncio.Semaphore(max(1, CLI_ARGS.concurrency))
+            total = len(rows_to_process)
 
-                file_base = build_output_file_base(source_index, tournament_name, age_category, url)
-                html_path = HTML_DIR / f"{file_base}.html"
-                screenshot_path = SCREENSHOT_DIR / f"{file_base}.png"
+            async def guarded_download(position: int, row: pd.Series) -> Dict[str, Any]:
+                async with semaphore:
+                    return await download_tournament_row(context, position, total, row)
 
-                print(f"[{i + 1}/{len(rows_to_process)}] opening {url}", flush=True)
-
-                page = await context.new_page()
-                status = "ok"
-                error_text = ""
-
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-
-                    try:
-                        print(f"[{i + 1}/{len(rows_to_process)}] waiting for rendered content", flush=True)
-                        await page.wait_for_load_state("networkidle", timeout=15000)
-                    except Exception:
-                        pass
-
-                    await page.wait_for_timeout(int(WAIT_AFTER_OPEN_SECONDS * 1000))
-                    print(f"[{i + 1}/{len(rows_to_process)}] expanding and scrolling", flush=True)
-                    await click_expand_buttons_if_any(page)
-                    await auto_scroll_page(page)
-                    await click_expand_buttons_if_any(page)
-                    await auto_scroll_page(page)
-
-                    print(f"[{i + 1}/{len(rows_to_process)}] saving html", flush=True)
-                    html_content = await page.content()
-                    html_path.write_text(html_content, encoding="utf-8")
-
-                    try:
-                        print(f"[{i + 1}/{len(rows_to_process)}] saving screenshot", flush=True)
-                        await page.screenshot(path=str(screenshot_path), full_page=True)
-                    except Exception:
-                        pass
-
-                except PlaywrightTimeoutError:
-                    status = "timeout"
-                    error_text = "PlaywrightTimeoutError"
-                except Exception as exc:
-                    status = "error"
-                    error_text = str(exc)
-                finally:
-                    await page.close()
-
-                save_log_rows.append({
-                    "source_index": source_index,
-                    "Турнир": tournament_name,
-                    "Возрастная категория": age_category,
-                    "Дата начала": start_date,
-                    "Город": city,
-                    "Ссылка на страницу с матчами": url,
-                    "tour_id": extract_tour_id(url),
-                    "html_path": str(html_path),
-                    "screenshot_path": str(screenshot_path),
-                    "save_status": status,
-                    "save_error": error_text,
-                    "skip_reason": "",
-                    "used_cached_html": False,
-                })
+            tasks = [
+                guarded_download(position, row)
+                for position, (_, row) in enumerate(rows_to_process.iterrows(), start=1)
+            ]
+            save_log_rows.extend(await asyncio.gather(*tasks))
 
         finally:
             await context.close()
@@ -440,15 +705,15 @@ async def save_rendered_pages_from_excel(input_excel_path: str) -> pd.DataFrame:
     if not skipped_df.empty:
         save_log_df = pd.concat([save_log_df, skipped_df], ignore_index=True)
     save_log_df.to_excel(SAVE_LOG_PATH, index=False)
+    stale_audit_df = save_log_df[
+        save_log_df.get("refresh_reason", pd.Series("", index=save_log_df.index)).fillna("").astype(str).ne("")
+    ].copy()
+    stale_audit_df.to_excel(STALE_AUDIT_PATH, index=False)
 
     if TOURNAMENTS_MASTER_PATH.exists() and "tour_id" in df.columns and "matches_page_saved" in df.columns:
-        ok_tour_ids = set(save_log_df.loc[save_log_df["save_status"].eq("ok"), "tour_id"].dropna().astype(str))
-        if ok_tour_ids:
-            updated_master = df.copy()
-            updated_master["tour_id"] = updated_master["tour_id"].astype(str)
-            updated_master.loc[updated_master["tour_id"].isin(ok_tour_ids), "matches_page_saved"] = True
-            updated_master.to_excel(TOURNAMENTS_MASTER_PATH, index=False)
-            print(f"Updated matches_page_saved for {len(ok_tour_ids)} tournaments in {TOURNAMENTS_MASTER_PATH}")
+        updated_master = update_master_from_save_log(df, save_log_df)
+        updated_master.to_excel(TOURNAMENTS_MASTER_PATH, index=False)
+        print(f"Updated cached-page status for {len(save_log_df)} tournaments in {TOURNAMENTS_MASTER_PATH}")
 
     return save_log_df
 
@@ -460,6 +725,9 @@ async def save_rendered_pages_from_excel(input_excel_path: str) -> pd.DataFrame:
 
 # Запуск сохранения страниц
 save_log_df = asyncio.run(save_rendered_pages_from_excel(INPUT_EXCEL_PATH))
+
+if CLI_ARGS.audit_only:
+    raise SystemExit(0)
 
 display(save_log_df.head(3))
 print(save_log_df["save_status"].value_counts(dropna=False))
@@ -919,6 +1187,14 @@ def parse_saved_htmls(save_log_df: pd.DataFrame) -> pd.DataFrame:
 
 
 matches_df = parse_saved_htmls(save_log_df)
+
+if TARGET_TOUR_IDS and RESULT_CSV_PATH.exists():
+    existing_matches_df = pd.read_csv(RESULT_CSV_PATH, encoding="utf-8-sig", low_memory=False)
+    existing_tour_ids = existing_matches_df["tour_id"].astype(str)
+    existing_matches_df = existing_matches_df[~existing_tour_ids.isin(TARGET_TOUR_IDS)].copy()
+    matches_df = pd.concat([existing_matches_df, matches_df], ignore_index=True)
+    matches_df = deduplicate_match_rows(matches_df)
+    print(f"Merged targeted refresh for {len(TARGET_TOUR_IDS)} tournament(s) into existing parsed matches.")
 
 print(matches_df.shape)
 display(matches_df.head(20))

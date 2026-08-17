@@ -27,6 +27,27 @@ def fit_sigmoid_calibrator(raw_probabilities, y_true) -> LogisticRegression:
 
 def apply_sigmoid_calibrator(raw_probabilities, calibrator: LogisticRegression) -> np.ndarray:
     x = probability_logit(raw_probabilities).reshape(-1, 1)
+    # The project bundle may be opened by an older Jupyter kernel.  sklearn
+    # 1.8 removed LogisticRegression.multi_class, while sklearn 1.4 expects
+    # that attribute inside predict_proba.  A fitted binary Platt calibrator is
+    # fully described by coef_ and intercept_, so calculate its positive-class
+    # probability directly instead of depending on version-specific internals.
+    coef = np.asarray(getattr(calibrator, "coef_", []), dtype=float)
+    intercept = np.asarray(getattr(calibrator, "intercept_", []), dtype=float).reshape(-1)
+    classes = np.asarray(getattr(calibrator, "classes_", []))
+    if (
+        coef.shape == (1, x.shape[1])
+        and intercept.size == 1
+        and classes.size == 2
+        and np.array_equal(classes, np.array([0, 1]))
+    ):
+        scores = x @ coef[0] + intercept[0]
+        calibrated = np.empty_like(scores, dtype=float)
+        nonnegative = scores >= 0
+        calibrated[nonnegative] = 1.0 / (1.0 + np.exp(-scores[nonnegative]))
+        exp_scores = np.exp(scores[~nonnegative])
+        calibrated[~nonnegative] = exp_scores / (1.0 + exp_scores)
+        return clip_prob(calibrated)
     return clip_prob(calibrator.predict_proba(x)[:, 1])
 
 

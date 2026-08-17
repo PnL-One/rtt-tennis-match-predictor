@@ -49,15 +49,22 @@ def Markdown(text):
 # То есть очки у игрока могут совпадать между категориями, но `rank_pre` берется из соответствующей возрастной группы.
 from pathlib import Path
 from collections import defaultdict
+from html import unescape
+from html.parser import HTMLParser
 from typing import Any, Optional
 
+import gc
 import json
+import os
 import re
 import zipfile
 
+os.environ.setdefault("OPENPYXL_LXML", "False")
+
 import numpy as np
 import pandas as pd
-from bs4 import BeautifulSoup
+from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 
 # ## 1. Настройки
@@ -237,10 +244,34 @@ if "as_path" not in globals():
         return Path(text).expanduser()
 
 
+class PageTextExtractor(HTMLParser):
+    """Collect visible text without building a cyclic BeautifulSoup DOM tree."""
+
+    SKIPPED_TAGS = {"script", "style", "noscript", "svg"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.lower() in self.SKIPPED_TAGS:
+            self.skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self.SKIPPED_TAGS and self.skip_depth:
+            self.skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip_depth and data:
+            self.parts.append(data)
+
+
 def extract_lines_from_html(html_text: str) -> list[str]:
-    soup = BeautifulSoup(html_text, "html.parser")
-    page_text = soup.get_text("\n")
-    lines = [normalize_text(line) for line in page_text.split("\n")]
+    parser = PageTextExtractor()
+    parser.feed(html_text)
+    parser.close()
+    lines = [normalize_text(part) for part in parser.parts]
     return [line for line in lines if line and line != "\u200b"]
 
 
@@ -400,46 +431,39 @@ def parse_match_rows_from_lines(lines: list[str], metadata: dict[str, Any]) -> l
 
 
 def extract_match_player_links_from_html(html_text: str) -> dict[str, list[dict[str, str]]]:
-    soup = BeautifulSoup(html_text, "html.parser")
     links_by_match: dict[str, list[dict[str, str]]] = {}
-    current_match_number = ""
-    current_players: list[dict[str, str]] = []
+    row_pattern = re.compile(r"<tr\b[^>]*>(.*?)</tr\s*>", flags=re.IGNORECASE | re.DOTALL)
+    index_pattern = re.compile(
+        r"<td\b(?=[^>]*\bclass\s*=\s*['\"][^'\"]*\bmatch_idx\b[^'\"]*['\"])[^>]*>(.*?)</td\s*>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    anchor_pattern = re.compile(
+        r"<a\b[^>]*\bhref\s*=\s*['\"]([^'\"]*/public/ranking/solo/(\d+)[^'\"]*)['\"][^>]*>(.*?)</a\s*>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    tag_pattern = re.compile(r"<[^>]+>", flags=re.DOTALL)
 
-    def flush_current() -> None:
-        if current_match_number and current_players:
-            links_by_match.setdefault(current_match_number, current_players[:2])
-
-    for tr in soup.find_all("tr"):
-        idx_cell = None
-        for td in tr.find_all("td", recursive=False):
-            classes = td.get("class") or []
-            if any(str(cls) == "match_idx" for cls in classes):
-                idx_cell = td
-                break
-
-        if idx_cell is not None:
-            flush_current()
-            current_match_number = normalize_text(idx_cell.get_text(" ", strip=True))
-            current_players = []
-
-        if not current_match_number:
+    for row_html in row_pattern.findall(html_text):
+        index_match = index_pattern.search(row_html)
+        if not index_match:
+            continue
+        match_number = normalize_text(unescape(tag_pattern.sub(" ", index_match.group(1))))
+        if not match_number:
             continue
 
-        for anchor in tr.find_all("a", href=True):
-            href = normalize_text(anchor.get("href"))
-            if "/public/ranking/solo/" not in href:
-                continue
-
-            name = normalize_text(anchor.get_text(" ", strip=True))
-            profile_id = extract_player_profile_id(href)
+        players: list[dict[str, str]] = []
+        for anchor_match in anchor_pattern.finditer(row_html):
+            href = normalize_text(unescape(anchor_match.group(1)))
+            profile_id = normalize_text(anchor_match.group(2))
+            name = normalize_text(unescape(tag_pattern.sub(" ", anchor_match.group(3))))
             if not name or not profile_id:
                 continue
-
             item = {"name": name, "href": href, "profile_id": profile_id}
-            if item not in current_players:
-                current_players.append(item)
+            if item not in players:
+                players.append(item)
+        if players:
+            links_by_match[match_number] = players[:2]
 
-    flush_current()
     return links_by_match
 
 
@@ -501,13 +525,18 @@ def parse_matches_html_dir(matches_html_dir: Path) -> pd.DataFrame:
     all_rows: list[dict[str, Any]] = []
 
     html_paths = sorted(matches_html_dir.glob("*.html"))
-    for html_path in html_paths:
+    for file_index, html_path in enumerate(html_paths, start=1):
+        if file_index == 1 or file_index % 25 == 0:
+            print(f"  HTML parse progress: {file_index}/{len(html_paths)} — {html_path.name}", flush=True)
         html_text = html_path.read_text(encoding="utf-8", errors="ignore")
         lines = extract_lines_from_html(html_text)
         metadata = parse_tournament_metadata(lines, html_path.name)
         rows = parse_match_rows_from_lines(lines, metadata)
         rows = attach_player_links_to_rows(rows, html_text)
         all_rows.extend(rows)
+        del html_text, lines, metadata, rows
+        if file_index % 25 == 0:
+            gc.collect()
 
     return finalize_parsed_matches(all_rows)
 
@@ -1341,23 +1370,65 @@ def write_final_predictor_file(
         {"section": "result", "metric": "rating_history_rows", "value": len(rating_history)},
     ])
 
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        ml_dataset.to_excel(writer, sheet_name="ml_dataset", index=False)
-        matches_enriched.to_excel(writer, sheet_name="matches_enriched", index=False)
-        player_matching.to_excel(writer, sheet_name="player_matching", index=False)
-        coverage.to_excel(writer, sheet_name="coverage", index=False)
-        rating_history.drop(columns=["name_key"], errors="ignore").to_excel(writer, sheet_name="rating_history", index=False)
-        matches_parsed_raw.to_excel(writer, sheet_name="matches_parsed_raw", index=False)
+    def excel_safe_value(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, pd.Timestamp):
+            if pd.isna(value):
+                return None
+            if value.tzinfo is not None:
+                value = value.tz_localize(None)
+            return value.to_pydatetime()
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, (bool, np.bool_)) and missing:
+                return None
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, str):
+            return ILLEGAL_CHARACTERS_RE.sub("", value)[:32767]
+        if isinstance(value, (dict, list, tuple, set)):
+            return ILLEGAL_CHARACTERS_RE.sub("", str(value))[:32767]
+        return value
 
-        players_without_rni.to_excel(writer, sheet_name="players_without_rni", index=False)
-        players_without_rating.to_excel(writer, sheet_name="players_without_rating", index=False)
-        dropped_invalid_matches.to_excel(writer, sheet_name="dropped_invalid_matches", index=False)
-        dropped_duplicate_matches.to_excel(writer, sheet_name="dropped_duplicate_matches", index=False)
+    def append_dataframe(workbook: Workbook, sheet_name: str, frame: pd.DataFrame) -> None:
+        worksheet = workbook.create_sheet(title=sheet_name[:31])
+        worksheet.append([excel_safe_value(column) for column in frame.columns])
+        for row_number, row in enumerate(frame.itertuples(index=False, name=None), start=1):
+            worksheet.append([excel_safe_value(value) for value in row])
+            if row_number % 50_000 == 0:
+                print(f"  {sheet_name}: {row_number}/{len(frame)} rows written", flush=True)
 
-        player_matching_audit.to_excel(writer, sheet_name="player_matching_audit", index=False)
-        ambiguous_rni_candidates.to_excel(writer, sheet_name="ambiguous_rni_candidates", index=False)
-        rating_age_group_check.to_excel(writer, sheet_name="rating_age_group_check", index=False)
-        build_summary.to_excel(writer, sheet_name="build_summary", index=False)
+    sheets = [
+        ("ml_dataset", ml_dataset),
+        ("matches_enriched", matches_enriched),
+        ("player_matching", player_matching),
+        ("coverage", coverage),
+        ("rating_history", rating_history.drop(columns=["name_key"], errors="ignore")),
+        ("matches_parsed_raw", matches_parsed_raw),
+        ("players_without_rni", players_without_rni),
+        ("players_without_rating", players_without_rating),
+        ("dropped_invalid_matches", dropped_invalid_matches),
+        ("dropped_duplicate_matches", dropped_duplicate_matches),
+        ("player_matching_audit", player_matching_audit),
+        ("ambiguous_rni_candidates", ambiguous_rni_candidates),
+        ("rating_age_group_check", rating_age_group_check),
+        ("build_summary", build_summary),
+    ]
+
+    temporary_output_path = output_path.with_name(f".{output_path.stem}.tmp{output_path.suffix}")
+    if temporary_output_path.exists():
+        temporary_output_path.unlink()
+
+    workbook = Workbook(write_only=True)
+    for sheet_name, frame in sheets:
+        print(f"Writing sheet {sheet_name}: {frame.shape}", flush=True)
+        append_dataframe(workbook, sheet_name, frame)
+
+    workbook.save(temporary_output_path)
+    temporary_output_path.replace(output_path)
 
     print("Финальный файл сохранен:")
     print(output_path)
