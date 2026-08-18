@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import html as html_module
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -29,9 +29,25 @@ CALENDAR_URL = f"{BASE_URL}/public/tours/calendar"
 DEFAULT_MASTER_PATH = PROJECT_ROOT / "data" / "tournaments_master.xlsx"
 DEBUG_DIR = PROJECT_ROOT / "data" / "calendar_debug"
 
-DEFAULT_AGE_CATEGORIES = ["до 17 лет", "до 19 лет", "Взрослые"]
+DEFAULT_CALENDAR_DATE_FROM = date(2025, 3, 1)
+DEFAULT_CALENDAR_FUTURE_DAYS = 180
+DEFAULT_AGE_CATEGORIES = ["до 15 лет", "до 17 лет", "до 19 лет", "Взрослые"]
+CALENDAR_TOURNAMENT_STATUSES = (
+    "Турнир завершен",
+    "Не состоялся",
+    "Сдача отчета",
+    "В процессе проведения",
+    "Готов к проведению",
+    "Жеребьевка",
+    "Жеребьёвка",
+    "Формирование состава",
+    "Подача поздних заявок",
+    "Подача заявок",
+    "Регистрация",
+)
 SHORT_TIMEOUT_MS = 3_000
 WAIT_AFTER_ACTION_MS = 700
+DETAIL_PAGE_RESET_EVERY = 200
 
 
 @dataclass(frozen=True)
@@ -44,7 +60,7 @@ class CalendarConfig:
     age_categories: tuple[str, ...] = tuple(DEFAULT_AGE_CATEGORIES)
     category: str = "Все"
     system: str = "Все"
-    federal_district: str = "Центральный ФО"
+    federal_district: str | None = "Все"
     subject: str | None = None
     city: str | None = None
     headless: bool = True
@@ -73,15 +89,35 @@ def parse_cli_date(value: str) -> date:
 
 
 def default_date_from(master_path: Path) -> date:
-    if not master_path.exists():
-        return date.today() - timedelta(days=30)
-    df = pd.read_excel(master_path, usecols=lambda col: col == "start_date")
-    if df.empty or "start_date" not in df.columns:
-        return date.today() - timedelta(days=30)
-    dates = pd.to_datetime(df["start_date"], errors="coerce")
-    if not dates.notna().any():
-        return date.today() - timedelta(days=30)
-    return dates.max().date() - timedelta(days=14)
+    return DEFAULT_CALENDAR_DATE_FROM
+
+
+def default_calendar_date_to(
+    today: date | None = None,
+    *,
+    future_days: int = DEFAULT_CALENDAR_FUTURE_DAYS,
+) -> date:
+    """Include announced future tournaments in the persistent calendar master."""
+
+    if future_days < 0:
+        raise ValueError("future_days must be non-negative")
+    return (today or date.today()) + timedelta(days=future_days)
+
+
+def iter_month_windows(date_from: date, date_to: date) -> Iterable[tuple[date, date]]:
+    """Split long calendar requests into month-sized windows."""
+    if date_to < date_from:
+        raise ValueError(f"date_to ({date_to}) must be greater than or equal to date_from ({date_from}).")
+
+    current = date_from
+    while current <= date_to:
+        if current.month == 12:
+            next_month = date(current.year + 1, 1, 1)
+        else:
+            next_month = date(current.year, current.month + 1, 1)
+        window_end = min(date_to, next_month - timedelta(days=1))
+        yield current, window_end
+        current = window_end + timedelta(days=1)
 
 
 def extract_tour_id(url: str) -> str | None:
@@ -210,14 +246,21 @@ def count_tour_links(element) -> int:
 
 
 def best_container(anchor):
+    best_single_tour_parent = None
     for parent in anchor.parents:
         if getattr(parent, "name", None) in {"body", "html"}:
             break
         text = normalize_text(parent.get_text("\n"))
-        if not text or len(text) > 2_000:
+        if not text or len(text) > 4_000:
             continue
         if count_tour_links(parent) == 1:
-            return parent
+            # Keep walking upward: the closest parent is usually only the draw
+            # row; the largest one-tour parent also contains tournament name,
+            # location and date range.
+            best_single_tour_parent = parent
+
+    if best_single_tour_parent is not None:
+        return best_single_tour_parent
 
     for parent in anchor.parents:
         if getattr(parent, "name", None) in {"tr", "li"}:
@@ -316,23 +359,30 @@ def parse_calendar_html(html: str, config: CalendarConfig, age_category: str, fe
             continue
 
         container = best_container(anchor)
-        container_text = normalize_text(container.get_text("\n"))
-        context_text = container_text
+        container_text = container.get_text("\n")
+        context_text = normalize_text(container_text)
         tournament_name = pick_tournament_name(anchor, container_text)
+        start_date = guess_start_date(context_text)
+        city = guess_city(context_text) or config.city or pd.NA
+        status = config.status
+        for candidate_status in CALENDAR_TOURNAMENT_STATUSES:
+            if candidate_status.lower() in context_text.lower():
+                status = candidate_status
+                break
 
         calendar_url = absolute_url(href)
         matches_url = matches_url_from_tour_id(tour_id)
         rows.append(
             {
                 "tour_id": tour_id,
-                "tournament_name": f"RTT tournament {tour_id}",
+                "tournament_name": tournament_name,
                 "age_category": age_category,
                 "gender": config.gender,
                 "draw_type": config.draw_type,
                 "federal_district": config.federal_district,
-                "city": config.city or pd.NA,
-                "start_date": pd.NaT,
-                "status": config.status,
+                "city": city,
+                "start_date": start_date,
+                "status": status,
                 "category": config.category,
                 "system": config.system,
                 "matches_url": matches_url,
@@ -409,7 +459,7 @@ def parse_tournament_detail_html_regex(html: str, row: dict, config: CalendarCon
             row[column] = value
 
     status_text = strip_html(html)
-    for status in ("Турнир завершен", "В процессе проведения", "Подача поздних заявок", "Подача заявок"):
+    for status in CALENDAR_TOURNAMENT_STATUSES:
         if status in status_text:
             row["status"] = status
             break
@@ -476,7 +526,7 @@ def parse_tournament_detail_html(
     row["system"] = labels.get("Система проведения", row.get("system", config.system))
 
     status_text = normalize_text(soup.get_text(" "))
-    for status in ("Турнир завершен", "В процессе проведения", "Подача поздних заявок", "Подача заявок"):
+    for status in CALENDAR_TOURNAMENT_STATUSES:
         if status in status_text:
             row["status"] = status
             break
@@ -805,6 +855,54 @@ async def fill_text_by_label(page, label_text: str, value: str) -> bool:
         return False
 
 
+async def set_calendar_period(page, date_from: date, date_to: date) -> bool:
+    date_values = [date_from.isoformat(), date_to.isoformat()]
+    try:
+        ok = await page.evaluate(
+            r"""
+            ([dateFrom, dateTo]) => {
+              const vm = document.querySelector('.ToursCalendarFilter')?.__vue__;
+              if (!vm) return false;
+
+              // Current RTT calendar (Vue composition API).
+              if (vm.uiFilters) {
+                vm.uiFilters.begin = dateFrom;
+                vm.uiFilters.end = dateTo;
+                return true;
+              }
+
+              // Legacy RTT calendar kept for backwards compatibility.
+              if (vm.filters) {
+                vm.$set(vm.filters, 'dates', [dateFrom, dateTo]);
+                if (vm.storageFilters && vm.storageFilters.value) {
+                  vm.$set(vm.storageFilters.value, 'dates', [dateFrom, dateTo]);
+                }
+                if (typeof vm.FiltersToStore === 'function') vm.FiltersToStore();
+                if (typeof vm.FiltersToStorage === 'function') vm.FiltersToStorage();
+                return true;
+              }
+              return false;
+            }
+            """,
+            date_values,
+        )
+        if not ok:
+            return False
+        await safe_wait(page, 300)
+        actual_values = await page.evaluate(
+            """
+            () => {
+              const vm = document.querySelector('.ToursCalendarFilter')?.__vue__;
+              if (vm?.uiFilters) return [vm.uiFilters.begin, vm.uiFilters.end];
+              return vm?.filters?.dates || null;
+            }
+            """
+        )
+        return list(actual_values or []) == date_values
+    except Exception:
+        return False
+
+
 async def click_find(page) -> None:
     for name in ("Найти", "Показать"):
         try:
@@ -829,10 +927,10 @@ async def set_rows_per_page(page, value: str = "100") -> bool:
         await footer_select.first.click(timeout=SHORT_TIMEOUT_MS)
         await safe_wait(page, 300)
         if await click_visible_option_by_text(page, value, exact=True):
-            await page.wait_for_timeout(1_500)
+            await wait_for_calendar_results(page, expected_page_size=value)
             return True
         if await click_visible_text_by_mouse(page, value, exact=True):
-            await page.wait_for_timeout(1_500)
+            await wait_for_calendar_results(page, expected_page_size=value)
             return True
         await page.keyboard.press("Escape")
         return False
@@ -840,39 +938,59 @@ async def set_rows_per_page(page, value: str = "100") -> bool:
         return False
 
 
-async def click_next_calendar_page(page) -> bool:
-    js = r"""
-    () => {
-        const visible = (el) => {
-            if (!el) return false;
-            const style = window.getComputedStyle(el);
-            const rect = el.getBoundingClientRect();
-            return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 4 && rect.height > 4;
-        };
-        const candidates = Array.from(document.querySelectorAll([
-            '.v-data-footer__icons-after button',
-            '.v-data-footer button[aria-label*="Next"]',
-            '.v-data-footer button[aria-label*="След"]',
-            '.v-data-footer button'
-        ].join(','))).filter(visible);
+async def wait_for_calendar_results(page, expected_page_size: str | None = None, timeout_ms: int = 30_000) -> None:
+    try:
+        await page.wait_for_function(
+            r"""
+            (expectedPageSize) => {
+              const footer = document.querySelector('.v-data-footer');
+              if (!footer) return false;
+              const text = (footer.innerText || '').replace(/\s+/g, ' ').trim();
+              if (expectedPageSize && !text.includes(expectedPageSize)) return false;
+              if (text.endsWith('–') || text.endsWith('-')) return false;
+              const links = document.querySelectorAll('a[href*="/public/tours/"]');
+              return links.length > 2 || /0-0|0 из 0/.test(text);
+            }
+            """,
+            expected_page_size,
+            timeout=timeout_ms,
+        )
+    except Exception:
+        await page.wait_for_timeout(2_000)
 
-        const enabled = candidates.filter(button => {
-            const disabled = button.disabled || button.getAttribute('aria-disabled') === 'true';
-            const classes = button.className || '';
-            return !disabled && !String(classes).includes('v-btn--disabled');
-        });
-        const button = enabled[0];
-        if (!button) return null;
-        const rect = button.getBoundingClientRect();
-        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-    }
-    """
-    point = await page.evaluate(js)
-    if not point:
-        return False
-    await page.mouse.click(point["x"], point["y"])
-    await page.wait_for_timeout(1_500)
-    return True
+
+async def click_next_calendar_page(page) -> bool:
+    footer = page.locator(".v-data-footer")
+    old_text = normalize_text(await footer.inner_text()) if await footer.count() else ""
+    candidates = [
+        page.locator(".v-data-footer__icons-after button"),
+        page.locator('.v-data-footer button[aria-label*="След"]'),
+        page.locator('.v-data-footer button[aria-label*="Next"]'),
+    ]
+    for locator in candidates:
+        try:
+            if await locator.count() == 0:
+                continue
+            button = locator.first
+            if not await button.is_visible() or await button.is_disabled():
+                continue
+            await button.click(timeout=SHORT_TIMEOUT_MS)
+            try:
+                await page.wait_for_function(
+                    r"""oldText => {
+                      const footer = document.querySelector('.v-data-footer');
+                      const text = (footer?.innerText || '').replace(/\s+/g, ' ').trim();
+                      return text && text !== oldText && !text.endsWith('–') && !text.endsWith('-');
+                    }""",
+                    old_text,
+                    timeout=30_000,
+                )
+            except Exception:
+                await page.wait_for_timeout(2_000)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 async def parse_all_calendar_pages(page, config: CalendarConfig, age_category: str) -> pd.DataFrame:
@@ -920,22 +1038,58 @@ async def fetch_tournament_detail(page, base_row: dict, config: CalendarConfig) 
     return parse_tournament_detail_html(html, base_row, config, datetime.now(timezone.utc).isoformat())
 
 
-async def enrich_calendar_details(page, calendar_df: pd.DataFrame, config: CalendarConfig) -> pd.DataFrame:
+def is_playwright_target_closed_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "target page" in message and ("closed" in message or "has been closed" in message)
+
+
+async def new_page(browser, config: CalendarConfig):
+    page = await browser.new_page()
+    page.set_default_timeout(config.timeout_ms)
+    return page
+
+
+async def close_page(page) -> None:
+    try:
+        if page and not page.is_closed():
+            await page.close()
+    except Exception:
+        pass
+
+
+async def reset_detail_page(browser, page, config: CalendarConfig):
+    await close_page(page)
+    return await new_page(browser, config)
+
+
+async def enrich_calendar_details(browser, page, calendar_df: pd.DataFrame, config: CalendarConfig) -> pd.DataFrame:
     if calendar_df.empty:
         return calendar_df
 
     rows: list[dict] = []
     total = len(calendar_df)
     for index, (_, base_row) in enumerate(calendar_df.iterrows(), start=1):
+        if page.is_closed() or (index > 1 and (index - 1) % DETAIL_PAGE_RESET_EVERY == 0):
+            page = await reset_detail_page(browser, page, config)
+
         tour_id = str(base_row["tour_id"])
         print(f"Fetching tournament details [{index}/{total}]: {tour_id}")
         try:
             rows.append(await fetch_tournament_detail(page, base_row.to_dict(), config))
         except Exception as exc:
+            if is_playwright_target_closed_error(exc):
+                print(f"Warning: detail page was closed for tour_id={tour_id}; reopening page and retrying once.")
+                try:
+                    page = await reset_detail_page(browser, page, config)
+                    rows.append(await fetch_tournament_detail(page, base_row.to_dict(), config))
+                    continue
+                except Exception as retry_exc:
+                    exc = retry_exc
             print(f"Warning: failed to fetch details for tour_id={tour_id}: {exc}")
             rows.append(base_row.to_dict())
             try:
-                await save_debug_artifacts(page, f"detail_fail_{tour_id}")
+                if not page.is_closed():
+                    await save_debug_artifacts(page, f"detail_fail_{tour_id}")
             except Exception:
                 pass
 
@@ -959,8 +1113,7 @@ async def apply_filters(page, config: CalendarConfig, age_category: str) -> list
         if value and not await set_dropdown_by_label(page, label, value, exact=exact) and required:
             failures.append(label)
 
-    period_value = f"с {config.date_from.strftime('%d.%m.%Y')} по {config.date_to.strftime('%d.%m.%Y')}"
-    if not await fill_text_by_label(page, "Период проведения", period_value):
+    if not await set_calendar_period(page, config.date_from, config.date_to):
         failures.append("Период проведения")
 
     return failures
@@ -973,7 +1126,14 @@ async def wait_for_calendar(page) -> None:
         try:
             print(f"Opening RTT calendar, attempt {attempt}/3", flush=True)
             await page.goto(CALENDAR_URL, wait_until="domcontentloaded", timeout=60_000)
-            await page.wait_for_timeout(5_000)
+            await page.locator(".ToursCalendarFilter").wait_for(state="attached", timeout=30_000)
+            await page.wait_for_function(
+                """() => {
+                  const vm = document.querySelector('.ToursCalendarFilter')?.__vue__;
+                  return Boolean(vm && (vm.uiFilters || vm.filters));
+                }""",
+                timeout=30_000,
+            )
 
             heading = page.get_by_role("heading", name="Календарь турниров", exact=True)
             if await heading.count():
@@ -1002,10 +1162,27 @@ async def fetch_calendar_age_group(page, config: CalendarConfig, age_category: s
     failures = await apply_filters(page, config, age_category)
     if failures:
         await save_debug_artifacts(page, f"filter_fail_{age_category}")
-        print(f"Warning: failed to set filters for {age_category}: {', '.join(failures)}")
+        raise RuntimeError(f"Failed to set calendar filters for {age_category}: {', '.join(failures)}")
     await click_find(page)
-    await page.wait_for_timeout(3_000)
-    return await parse_all_calendar_pages(page, config, age_category)
+    await wait_for_calendar_results(page)
+    parsed = await parse_all_calendar_pages(page, config, age_category)
+    if parsed.empty:
+        return parsed
+
+    parsed_dates = pd.to_datetime(parsed["start_date"], errors="coerce")
+    valid_window = parsed_dates.between(pd.Timestamp(config.date_from), pd.Timestamp(config.date_to), inclusive="both")
+    rejected = parsed.loc[~valid_window].copy()
+    if not rejected.empty:
+        print(
+            f"Rejected {len(rejected)} calendar rows outside requested window "
+            f"{config.date_from}..{config.date_to} for {age_category}.",
+            flush=True,
+        )
+        print(
+            rejected[["tour_id", "tournament_name", "start_date"]].head(10).to_string(index=False),
+            flush=True,
+        )
+    return parsed.loc[valid_window].reset_index(drop=True)
 
 
 async def fetch_calendar(config: CalendarConfig) -> pd.DataFrame:
@@ -1018,21 +1195,27 @@ async def fetch_calendar(config: CalendarConfig) -> pd.DataFrame:
         ) from exc
 
     frames: list[pd.DataFrame] = []
+    windows = list(iter_month_windows(config.date_from, config.date_to))
     async with async_playwright() as playwright:
         launcher = getattr(playwright, config.browser_engine)
         browser = await launcher.launch(headless=config.headless)
-        page = await browser.new_page()
-        page.set_default_timeout(config.timeout_ms)
+        page = await new_page(browser, config)
         try:
             for age_category in config.age_categories:
-                print(f"Parsing calendar age group: {age_category}")
-                frames.append(await fetch_calendar_age_group(page, config, age_category))
+                for window_index, (window_from, window_to) in enumerate(windows, start=1):
+                    window_config = replace(config, date_from=window_from, date_to=window_to)
+                    print(
+                        f"Parsing calendar age group: {age_category} "
+                        f"[{window_index}/{len(windows)}] {window_from}..{window_to}",
+                        flush=True,
+                    )
+                    frames.append(await fetch_calendar_age_group(page, window_config, age_category))
             calendar_ids = (
                 pd.concat(frames, ignore_index=True).drop_duplicates(subset=["tour_id"], keep="first")
                 if frames
                 else pd.DataFrame(columns=MASTER_COLUMNS)
             )
-            result = await enrich_calendar_details(page, calendar_ids, config)
+            result = await enrich_calendar_details(browser, page, calendar_ids, config)
         finally:
             await browser.close()
 
@@ -1045,6 +1228,18 @@ def merge_into_master(incoming: pd.DataFrame, master_path: Path) -> pd.DataFrame
     master_path.parent.mkdir(parents=True, exist_ok=True)
     master.to_excel(master_path, index=False)
     return master
+
+
+def prune_invalid_master_placeholders(master: pd.DataFrame, config: CalendarConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if master.empty:
+        return master.copy(), master.copy()
+    names = master["tournament_name"].fillna("").astype(str).str.strip()
+    dates = pd.to_datetime(master["start_date"], errors="coerce")
+    in_scope = dates.between(pd.Timestamp(config.date_from), pd.Timestamp(config.date_to), inclusive="both")
+    invalid_mask = names.str.match(r"^RTT tournament \d+$", case=False, na=False) & ~in_scope
+    rejected = master.loc[invalid_mask].copy()
+    cleaned = master.loc[~invalid_mask].copy().reset_index(drop=True)
+    return cleaned, rejected
 
 
 def parse_age_categories(values: Iterable[str]) -> tuple[str, ...]:
@@ -1061,9 +1256,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Parse RTT tournament calendar and update data/tournaments_master.xlsx.")
     parser.add_argument("--master", type=Path, default=DEFAULT_MASTER_PATH, help="Tournament master Excel path.")
     parser.add_argument("--date-from", type=parse_cli_date, default=None, help="Calendar start date: DD.MM.YYYY or YYYY-MM-DD.")
-    parser.add_argument("--date-to", type=parse_cli_date, default=date.today(), help="Calendar end date: DD.MM.YYYY or YYYY-MM-DD.")
+    parser.add_argument(
+        "--date-to",
+        type=parse_cli_date,
+        default=None,
+        help="Calendar end date: DD.MM.YYYY or YYYY-MM-DD. Overrides --future-days.",
+    )
+    parser.add_argument(
+        "--future-days",
+        type=int,
+        default=DEFAULT_CALENDAR_FUTURE_DAYS,
+        help=(
+            "When --date-to is omitted, retain announced tournaments this many days ahead "
+            f"(default: {DEFAULT_CALENDAR_FUTURE_DAYS})."
+        ),
+    )
     parser.add_argument("--age", action="append", default=None, help="Age category. Can be repeated or comma-separated.")
-    parser.add_argument("--federal-district", default="Центральный ФО")
+    parser.add_argument("--federal-district", default="Все")
     parser.add_argument("--gender", default="Женский")
     parser.add_argument("--draw-type", default="Одиночный")
     parser.add_argument("--status", default="Все")
@@ -1073,11 +1282,13 @@ def main() -> None:
     parser.add_argument("--city", default=None)
     parser.add_argument("--headed", action="store_true", help="Show browser window while parsing.")
     args = parser.parse_args()
+    if args.future_days < 0:
+        parser.error("--future-days must be non-negative")
 
     master_path = args.master if args.master.is_absolute() else PROJECT_ROOT / args.master
     config = CalendarConfig(
         date_from=args.date_from or default_date_from(master_path),
-        date_to=args.date_to,
+        date_to=args.date_to or default_calendar_date_to(future_days=args.future_days),
         status=args.status,
         draw_type=args.draw_type,
         gender=args.gender,
@@ -1097,6 +1308,13 @@ def main() -> None:
 
     existing_rows = len(pd.read_excel(master_path)) if master_path.exists() else 0
     master = merge_into_master(incoming, master_path)
+    _, rejected_placeholders = prune_invalid_master_placeholders(master, config)
+    if not rejected_placeholders.empty:
+        reject_path = DEBUG_DIR / "rejected_master_placeholders.xlsx"
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        rejected_placeholders.to_excel(reject_path, index=False)
+        print(f"Quarantined invalid placeholder tournaments (kept in master): {len(rejected_placeholders)}")
+        print(f"Quarantine audit: {reject_path.relative_to(PROJECT_ROOT)}")
     print(f"Parsed tournaments: {len(incoming)}")
     print(f"Master before: {existing_rows}")
     print(f"Master after: {len(master)}")

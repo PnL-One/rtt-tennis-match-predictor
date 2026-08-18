@@ -463,8 +463,10 @@ def build_common_opponent_prediction_features(
     player_a_id: str,
     player_b_id: str,
     prediction_date: pd.Timestamp,
+    stats_by_player: dict[str, dict[str, dict[str, Any]]] | None = None,
 ) -> pd.DataFrame:
-    stats_by_player = build_common_opponent_stats_until(long_feat, prediction_date)
+    if stats_by_player is None:
+        stats_by_player = build_common_opponent_stats_until(long_feat, prediction_date)
     rows = [
         common_opponent_features_for_pair(stats_by_player, player_a_id, player_b_id, -1, "player1", prediction_date),
         common_opponent_features_for_pair(stats_by_player, player_b_id, player_a_id, -1, "player2", prediction_date),
@@ -480,12 +482,19 @@ def build_single_prediction_row(
     perspective: str,
     context: dict[str, Any],
     elo_state: dict[str, float],
+    prediction_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     long_feat = bundle["long_feat"]
-    player_last = get_last_player_snapshot(long_feat, player_id, prediction_date)
-    opponent_last = get_last_player_snapshot(long_feat, opponent_id, prediction_date)
-    player_history = player_history_rows(long_feat, player_id, prediction_date)
-    opponent_history = player_history_rows(long_feat, opponent_id, prediction_date)
+    prediction_state = prediction_state or {}
+    history_by_player = prediction_state.get("history_by_player", {})
+    player_history = history_by_player.get(str(player_id))
+    opponent_history = history_by_player.get(str(opponent_id))
+    if player_history is None:
+        player_history = player_history_rows(long_feat, player_id, prediction_date)
+    if opponent_history is None:
+        opponent_history = player_history_rows(long_feat, opponent_id, prediction_date)
+    player_last = player_history.iloc[-1] if not player_history.empty else None
+    opponent_last = opponent_history.iloc[-1] if not opponent_history.empty else None
     player_elo = float(elo_state.get(str(player_id), ELO_BASE_RATING))
     opponent_elo = float(elo_state.get(str(opponent_id), ELO_BASE_RATING))
     expected = 1.0 / (1.0 + 10.0 ** ((opponent_elo - player_elo) / 400.0))
@@ -502,19 +511,40 @@ def build_single_prediction_row(
 
     player_days_since = days_since_last_match(player_history)
     opponent_days_since = days_since_last_match(opponent_history)
-    h2h = h2h_stats_until(long_feat, player_id, opponent_id, prediction_date)
-    player_rating = rating_snapshot(
-        bundle,
-        player_id,
-        prediction_date,
-        context.get("tournament_age_category"),
-    )
-    opponent_rating = rating_snapshot(
-        bundle,
-        opponent_id,
-        prediction_date,
-        context.get("tournament_age_category"),
-    )
+    common_stats = prediction_state.get("common_stats")
+    if common_stats is not None:
+        direct = common_stats.get(str(player_id), {}).get(str(opponent_id), {})
+        direct_n = int(direct.get("n", 0))
+        direct_wins = int(direct.get("wins", 0))
+        h2h = {
+            "h2h_matches_before": direct_n,
+            "h2h_player_wins_before": direct_wins,
+            "h2h_player_winrate_before": direct_wins / direct_n if direct_n else np.nan,
+        }
+    else:
+        h2h = h2h_stats_until(long_feat, player_id, opponent_id, prediction_date)
+
+    rating_cache = prediction_state.setdefault("rating_cache", {})
+    rating_key_player = (str(player_id), normalize_age_group(context.get("tournament_age_category")))
+    rating_key_opponent = (str(opponent_id), normalize_age_group(context.get("tournament_age_category")))
+    if rating_key_player not in rating_cache:
+        rating_cache[rating_key_player] = rating_snapshot(
+            bundle,
+            player_id,
+            prediction_date,
+            context.get("tournament_age_category"),
+        )
+    if rating_key_opponent not in rating_cache:
+        rating_cache[rating_key_opponent] = rating_snapshot(
+            bundle,
+            opponent_id,
+            prediction_date,
+            context.get("tournament_age_category"),
+        )
+    player_rating = rating_cache[rating_key_player]
+    opponent_rating = rating_cache[rating_key_opponent]
+    player_override = prediction_state.get("player_overrides", {}).get(str(player_id), {})
+    opponent_override = prediction_state.get("player_overrides", {}).get(str(opponent_id), {})
 
     return {
         "match_id": -1,
@@ -522,8 +552,8 @@ def build_single_prediction_row(
         "perspective": perspective,
         "player_id": str(player_id),
         "opponent_id": str(opponent_id),
-        "player_name": from_last(player_last, "player_name", str(player_id)),
-        "opponent_name": from_last(opponent_last, "player_name", str(opponent_id)),
+        "player_name": player_override.get("name", from_last(player_last, "player_name", str(player_id))),
+        "opponent_name": opponent_override.get("name", from_last(opponent_last, "player_name", str(opponent_id))),
         "tournament_name": context.get("tournament_name", "__UNKNOWN_TOURNAMENT__"),
         "tournament_city": context.get("tournament_city", "__UNKNOWN_CITY__"),
         "tournament_age_category": context.get("tournament_age_category", "__UNKNOWN_AGE__"),
@@ -532,10 +562,10 @@ def build_single_prediction_row(
         "elo_opp_pre": opponent_elo,
         "elo_diff": player_elo - opponent_elo,
         "expected_win_prob_elo": expected,
-        "player_rank_pre": player_rating.get("rank", from_last(player_last, "player_rank_pre")),
-        "opponent_rank_pre": opponent_rating.get("rank", from_last(opponent_last, "player_rank_pre")),
-        "player_points_pre": player_rating.get("points", from_last(player_last, "player_points_pre")),
-        "opponent_points_pre": opponent_rating.get("points", from_last(opponent_last, "player_points_pre")),
+        "player_rank_pre": player_rating.get("rank", player_override.get("rank", from_last(player_last, "player_rank_pre"))),
+        "opponent_rank_pre": opponent_rating.get("rank", opponent_override.get("rank", from_last(opponent_last, "player_rank_pre"))),
+        "player_points_pre": player_rating.get("points", player_override.get("points", from_last(player_last, "player_points_pre"))),
+        "opponent_points_pre": opponent_rating.get("points", opponent_override.get("points", from_last(opponent_last, "player_points_pre"))),
         "player_rating_date_pre": player_rating.get("classification_date", from_last(player_last, "player_rating_date_pre")),
         "opponent_rating_date_pre": opponent_rating.get("classification_date", from_last(opponent_last, "player_rating_date_pre")),
         "player_rating_age_group_pre": player_rating.get("age_group", from_last(player_last, "player_rating_age_group_pre")),
@@ -574,26 +604,40 @@ def build_prediction_rows(
     player_b_id: str,
     prediction_date: pd.Timestamp,
     context: dict[str, Any] | None = None,
+    prediction_state: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     long_feat = bundle["long_feat"]
     features = list(bundle["features"])
     context = dict(context or {})
     prediction_date = pd.Timestamp(prediction_date)
-    elo_state = compute_elo_state_until(long_feat, prediction_date)
+    prediction_state = prediction_state or {}
+    elo_state = prediction_state.get("elo_state")
+    if elo_state is None:
+        elo_state = compute_elo_state_until(long_feat, prediction_date)
 
     pred_df = pd.DataFrame([
-        build_single_prediction_row(bundle, player_a_id, player_b_id, prediction_date, "player1", context, elo_state),
-        build_single_prediction_row(bundle, player_b_id, player_a_id, prediction_date, "player2", context, elo_state),
+        build_single_prediction_row(
+            bundle, player_a_id, player_b_id, prediction_date, "player1", context, elo_state, prediction_state
+        ),
+        build_single_prediction_row(
+            bundle, player_b_id, player_a_id, prediction_date, "player2", context, elo_state, prediction_state
+        ),
     ])
     pred_df = add_adjusted_rating_features(pred_df)
     pred_df = add_relative_diff_to_min_features(pred_df)
     pred_df = add_observed_only_features(pred_df)
-    common_pred = build_common_opponent_prediction_features(long_feat, player_a_id, player_b_id, prediction_date)
+    common_pred = build_common_opponent_prediction_features(
+        long_feat,
+        player_a_id,
+        player_b_id,
+        prediction_date,
+        stats_by_player=prediction_state.get("common_stats"),
+    )
     pred_df = pred_df.drop(columns=[col for col in COMMON_OPP_FEATURES if col in pred_df.columns], errors="ignore")
     pred_df = pred_df.merge(common_pred, on="perspective", how="left", validate="one_to_one")
     pred_df = fill_feature_nans(pred_df)
 
-    medians = numeric_feature_medians(bundle)
+    medians = prediction_state.get("feature_medians") or numeric_feature_medians(bundle)
     for col in features:
         if col not in pred_df.columns:
             pred_df[col] = medians.get(col, np.nan)
@@ -601,6 +645,62 @@ def build_prediction_rows(
         if col in medians:
             pred_df[col] = pred_df[col].fillna(medians[col])
     return pred_df
+
+
+def prepare_prediction_state(
+    bundle: dict[str, Any],
+    prediction_date: str | pd.Timestamp,
+    *,
+    player_overrides: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Precompute expensive date-level state for many forecasts on one date."""
+
+    long_feat = bundle["long_feat"]
+    prediction_date = pd.Timestamp(prediction_date)
+    history = long_feat[pd.to_datetime(long_feat["match_date"], errors="coerce") < prediction_date].copy()
+    history = history.sort_values(["match_date", "match_id"])
+    history_by_player = {
+        str(player_id): group.copy()
+        for player_id, group in history.groupby(history["player_id"].astype(str), sort=False)
+    }
+    return {
+        "prediction_date": prediction_date,
+        "elo_state": compute_elo_state_until(long_feat, prediction_date),
+        "common_stats": build_common_opponent_stats_until(long_feat, prediction_date),
+        "feature_medians": numeric_feature_medians(bundle),
+        "history_by_player": history_by_player,
+        "rating_cache": {},
+        "player_overrides": dict(player_overrides or {}),
+    }
+
+
+def predict_pair_by_ids(
+    bundle: dict[str, Any],
+    player1_id: str,
+    player2_id: str,
+    prediction_date: str | pd.Timestamp,
+    *,
+    context: dict[str, Any] | None = None,
+    prediction_state: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    """Lightweight symmetric forecast used for tournament pair matrices."""
+
+    prediction_date = pd.Timestamp(prediction_date)
+    pred_rows = build_prediction_rows(
+        bundle,
+        str(player1_id),
+        str(player2_id),
+        prediction_date,
+        context=context,
+        prediction_state=prediction_state,
+    )
+    pred_rows["p_model_raw"] = bundle["model"].predict_proba(pred_rows[list(bundle["features"])])[:, 1]
+    summary = symmetrize_pair_probs(pred_rows, "p_model_raw")
+    return {
+        "p_player1_win": summary["p_player1_sym"],
+        "p_player2_win": summary["p_player2_sym"],
+        "symmetry_gap_abs": summary["symmetry_gap_abs"],
+    }
 
 
 def numeric_feature_medians(bundle: dict[str, Any]) -> dict[str, float]:

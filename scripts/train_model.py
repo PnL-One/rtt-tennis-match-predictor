@@ -188,6 +188,7 @@ CATBOOST_PARAM_GRID = {
 # Параметры GBM и Random Forest подбираются на внутреннем time-based validation
 # внутри train-периода. Final test не используется для подбора гиперпараметров.
 SKLEARN_SEARCH_N_JOBS = min(12, max(1, (os.cpu_count() or 1) // 2))
+GBM_SEARCH_N_JOBS = min(8, max(1, (os.cpu_count() or 1) // 2))
 
 GBM_PARAMS = dict(
     n_estimators=700,               #число деревьев в градиентном бустинге
@@ -1802,6 +1803,79 @@ def sort_tuning_results(table: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def evaluate_gbm_staged_fit(
+    *,
+    fit_idx: int,
+    fit_count: int,
+    base_grid_params: dict,
+    n_estimators_grid: list[int],
+    X_train_imputed: np.ndarray,
+    y_train: pd.Series,
+    X_valid_imputed: np.ndarray,
+    y_valid: pd.Series,
+) -> tuple[list[dict], dict[str, dict]]:
+    """Fit one GBM configuration and score all requested staged tree counts."""
+    max_n_estimators = max(n_estimators_grid)
+    fit_params = {
+        **base_grid_params,
+        "n_estimators": max_n_estimators,
+        "random_state": RANDOM_SEED,
+    }
+    print(
+        f"Tuning GBM staged fit [{fit_idx}/{fit_count}]: "
+        f"{format_param_dict(fit_params)}",
+        flush=True,
+    )
+
+    started_at = perf_counter()
+    model = GradientBoostingClassifier(**fit_params)
+    model.fit(X_train_imputed, y_train)
+    fit_seconds = perf_counter() - started_at
+
+    train_stage_predictions = {
+        step_idx: probabilities[:, 1]
+        for step_idx, probabilities in enumerate(
+            model.staged_predict_proba(X_train_imputed),
+            start=1,
+        )
+        if step_idx in n_estimators_grid
+    }
+    valid_stage_predictions = {
+        step_idx: probabilities[:, 1]
+        for step_idx, probabilities in enumerate(
+            model.staged_predict_proba(X_valid_imputed),
+            start=1,
+        )
+        if step_idx in n_estimators_grid
+    }
+
+    rows: list[dict] = []
+    params_by_candidate_id: dict[str, dict] = {}
+    candidates_per_fit = len(n_estimators_grid)
+    for stage_idx, n_estimators in enumerate(n_estimators_grid, start=1):
+        params = {
+            **base_grid_params,
+            "n_estimators": n_estimators,
+            "random_state": RANDOM_SEED,
+        }
+        candidate_number = (fit_idx - 1) * candidates_per_fit + stage_idx
+        candidate_id = f"gbm_{candidate_number:03d}"
+        params_by_candidate_id[candidate_id] = params
+        rows.append(evaluate_probability_candidate(
+            candidate_id=candidate_id,
+            model_name="final_gbm",
+            stage="validation_staged_grid",
+            params=params,
+            p_train=train_stage_predictions[n_estimators],
+            p_valid=valid_stage_predictions[n_estimators],
+            y_train=y_train,
+            y_valid=y_valid,
+            fit_seconds=fit_seconds / candidates_per_fit,
+            complexity_score=gbm_complexity_score(params),
+        ))
+    return rows, params_by_candidate_id
+
+
 def tune_gbm_model(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -1809,7 +1883,6 @@ def tune_gbm_model(
     y_valid: pd.Series,
 ) -> tuple[dict, pd.DataFrame]:
     n_estimators_grid = sorted(GBM_PARAM_GRID["n_estimators"])
-    max_n_estimators = max(n_estimators_grid)
     fit_grid = {
         key: value
         for key, value in GBM_PARAM_GRID.items()
@@ -1817,70 +1890,41 @@ def tune_gbm_model(
     }
     fit_candidates = iter_param_grid(fit_grid)
     candidate_count = len(fit_candidates) * len(n_estimators_grid)
+    print(
+        f"GBM grid: {candidate_count} staged candidates from {len(fit_candidates)} fits; "
+        f"parallel workers={GBM_SEARCH_N_JOBS}",
+        flush=True,
+    )
+
+    # Median imputation is independent of GBM parameters. Fitting it once also lets
+    # joblib share the resulting NumPy arrays efficiently between worker processes.
+    imputer = SimpleImputer(strategy="median")
+    X_train_imputed = imputer.fit_transform(X_train)
+    X_valid_imputed = imputer.transform(X_valid)
+
+    fit_outputs = joblib.Parallel(
+        n_jobs=GBM_SEARCH_N_JOBS,
+        prefer="processes",
+        verbose=5,
+    )(
+        joblib.delayed(evaluate_gbm_staged_fit)(
+            fit_idx=fit_idx,
+            fit_count=len(fit_candidates),
+            base_grid_params=base_grid_params,
+            n_estimators_grid=n_estimators_grid,
+            X_train_imputed=X_train_imputed,
+            y_train=y_train,
+            X_valid_imputed=X_valid_imputed,
+            y_valid=y_valid,
+        )
+        for fit_idx, base_grid_params in enumerate(fit_candidates, start=1)
+    )
+
     rows = []
     params_by_candidate_id = {}
-
-    for fit_idx, base_grid_params in enumerate(fit_candidates, start=1):
-        fit_params = {
-            **base_grid_params,
-            "n_estimators": max_n_estimators,
-            "random_state": RANDOM_SEED,
-        }
-        print(
-            f"Tuning GBM staged fit [{fit_idx}/{len(fit_candidates)}]: "
-            f"{format_param_dict(fit_params)}"
-        )
-
-        started_at = perf_counter()
-        model = fit_sklearn_main_model(
-            GradientBoostingClassifier(**fit_params),
-            X_train,
-            y_train,
-        )
-        fit_seconds = perf_counter() - started_at
-
-        train_stage_predictions = {
-            step_idx: probabilities[:, 1]
-            for step_idx, probabilities in enumerate(
-                model.named_steps["model"].staged_predict_proba(model.named_steps["imputer"].transform(X_train)),
-                start=1,
-            )
-            if step_idx in n_estimators_grid
-        }
-        valid_stage_predictions = {
-            step_idx: probabilities[:, 1]
-            for step_idx, probabilities in enumerate(
-                model.named_steps["model"].staged_predict_proba(model.named_steps["imputer"].transform(X_valid)),
-                start=1,
-            )
-            if step_idx in n_estimators_grid
-        }
-
-        for n_estimators in n_estimators_grid:
-            params = {
-                **base_grid_params,
-                "n_estimators": n_estimators,
-                "random_state": RANDOM_SEED,
-            }
-            candidate_id = f"gbm_{len(rows) + 1:03d}"
-            params_by_candidate_id[candidate_id] = params
-            row = evaluate_probability_candidate(
-                candidate_id=candidate_id,
-                model_name="final_gbm",
-                stage="validation_staged_grid",
-                params=params,
-                p_train=train_stage_predictions[n_estimators],
-                p_valid=valid_stage_predictions[n_estimators],
-                y_train=y_train,
-                y_valid=y_valid,
-                fit_seconds=fit_seconds / len(n_estimators_grid),
-                complexity_score=gbm_complexity_score(params),
-            )
-            rows.append(row)
-            print(
-                f"  GBM staged candidate [{len(rows)}/{candidate_count}]: "
-                f"n_estimators={n_estimators}, valid_logloss={row['valid_logloss']:.6f}"
-            )
+    for fit_rows, fit_params_by_candidate_id in fit_outputs:
+        rows.extend(fit_rows)
+        params_by_candidate_id.update(fit_params_by_candidate_id)
 
     table = sort_tuning_results(pd.DataFrame(rows))
     selected_candidate_id = str(table.iloc[0]["candidate_id"])
